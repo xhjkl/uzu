@@ -24,4 +24,4 @@ pub use device_profile::{DeviceGeneration, DeviceProfile, DeviceSize};
 #[cfg(test)]
 pub use kernel::matmul::gemm::GemmEngine;
 #[cfg(test)]
-pub(crate) use kernel::matmul::gemv::{GemvDispatch, GemvSpecialization};
+pub(crate) use kernel::matmul::gemv::{GemvDispatch, GemvSpecialization, ResidentInt8ExpertTensorOpsDispatch};

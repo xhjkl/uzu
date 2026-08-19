@@ -1,11 +1,17 @@
+use std::mem::size_of;
+
+use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Allocation, Backend,
+        Allocation, AllocationType, Backend, Context,
         gpu_types::{QuantizationMethod, QuantizationMode},
         kernel::matmul::MatmulB,
-        microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
+        microfloat::{
+            MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata, check_int32_accumulator_bound, e2m1_to_exact_i8,
+            mxfp4_exact_int8_scale,
+        },
     },
     config::weight_matrix::{
         AnyWeightMatrixSpec, Layout,
@@ -19,6 +25,8 @@ use crate::{
 pub enum WeightMatrixError<B: Backend> {
     #[error("Parameter loading error: {0}")]
     ParameterError(#[from] ParameterLoaderError<B>),
+    #[error("Backend error: {0}")]
+    BackendError(#[source] B::Error),
     #[error("Unsupported weight matrix configuration: {0}")]
     UnsupportedConfiguration(String),
 }
@@ -143,7 +151,48 @@ struct Quantized<B: Backend> {
 struct Microfloat<B: Backend> {
     scales: Allocation<B>,
     outer_scales: Allocation<B>,
+    #[allow(dead_code)]
+    outer_scale_data_type: DataType,
     metadata: MicrofloatMetadata,
+}
+
+/// Storage expansion incurred by the resident INT8 TensorOps representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct DerivedInt8BankStatistics {
+    pub source_code_bytes: usize,
+    pub source_scale_bytes: usize,
+    pub derived_code_bytes: usize,
+    pub derived_scale_bytes: usize,
+    pub group_count: usize,
+}
+
+/// Exact group-32 INT8 representation derived from canonical MXFP4 storage.
+#[allow(dead_code)]
+pub struct DerivedInt8Bank<B: Backend> {
+    codes: Allocation<B>,
+    scales: Allocation<B>,
+    group_size: u32,
+    statistics: DerivedInt8BankStatistics,
+}
+
+#[allow(dead_code)]
+impl<B: Backend> DerivedInt8Bank<B> {
+    pub fn codes(&self) -> &Allocation<B> {
+        &self.codes
+    }
+
+    pub fn scales(&self) -> &Allocation<B> {
+        &self.scales
+    }
+
+    pub fn group_size(&self) -> u32 {
+        self.group_size
+    }
+
+    pub fn statistics(&self) -> DerivedInt8BankStatistics {
+        self.statistics
+    }
 }
 
 pub struct WeightMatrix<B: Backend> {
@@ -236,6 +285,7 @@ impl<B: Backend> WeightMatrix<B> {
                 microfloat: Some(Microfloat {
                     scales,
                     outer_scales,
+                    outer_scale_data_type: data_type,
                     metadata,
                 }),
             });
@@ -369,6 +419,109 @@ impl<B: Backend> WeightMatrix<B> {
                 signed_codes,
             },
         }
+    }
+
+    /// Expand canonical group-32 MXFP4 into the resident TensorOps layout.
+    #[allow(dead_code)]
+    pub fn materialize_mxfp4_int8_bank(
+        &self,
+        context: &B::Context,
+    ) -> Result<DerivedInt8Bank<B>, WeightMatrixError<B>> {
+        let Some(microfloat) = self.microfloat.as_ref() else {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "derived INT8 banks require canonical MXFP4 storage".into(),
+            ));
+        };
+        let metadata = microfloat.metadata;
+        if metadata.format() != MicrofloatFormat::Mxfp4 || metadata.group_size() != 32 {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "resident INT8 TensorOps require group-32 E8M0 MXFP4 weights".into(),
+            ));
+        }
+        check_int32_accumulator_bound(127, 12, 32)
+            .map_err(|error| WeightMatrixError::UnsupportedConfiguration(error.to_string()))?;
+        let source_codes = self.values.as_slice::<u8>();
+        let source_scales = microfloat.scales.as_slice::<u8>();
+        if source_scales.contains(&255) {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "cannot materialize an INT8 bank containing invalid E8M0 exponent 255".into(),
+            ));
+        }
+
+        let outer_scale = |matrix: usize| -> Result<f32, WeightMatrixError<B>> {
+            let scale = match microfloat.outer_scale_data_type {
+                DataType::F16 => microfloat.outer_scales.as_slice::<f16>()[matrix].to_f32(),
+                DataType::BF16 => microfloat.outer_scales.as_slice::<bf16>()[matrix].to_f32(),
+                DataType::F32 => microfloat.outer_scales.as_slice::<f32>()[matrix],
+                data_type => {
+                    return Err(WeightMatrixError::UnsupportedConfiguration(format!(
+                        "MXFP4 outer scale type {data_type:?} cannot be converted to an INT8 bank"
+                    )));
+                },
+            };
+            if !scale.is_finite() {
+                return Err(WeightMatrixError::UnsupportedConfiguration(
+                    "MXFP4 outer scales must be finite for an INT8 bank".into(),
+                ));
+            }
+            Ok(scale)
+        };
+
+        let code_count = metadata
+            .required_code_bytes()
+            .checked_mul(2)
+            .ok_or_else(|| WeightMatrixError::UnsupportedConfiguration("derived code size overflows usize".into()))?;
+        let scale_count = metadata.required_scale_bytes();
+        let mut codes =
+            context.create_allocation(code_count, AllocationType::Global).map_err(WeightMatrixError::BackendError)?;
+        let scale_bytes = scale_count
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| WeightMatrixError::UnsupportedConfiguration("derived scale size overflows usize".into()))?;
+        let mut scales =
+            context.create_allocation(scale_bytes, AllocationType::Global).map_err(WeightMatrixError::BackendError)?;
+
+        let codes_out = codes.as_slice_mut::<i8>();
+        let scales_out = scales.as_slice_mut::<f32>();
+        let rows = metadata.rows() as usize;
+        let columns = metadata.columns() as usize;
+        let groups_per_row = metadata.scale_row_stride();
+        for matrix in 0..metadata.matrix_count() as usize {
+            let outer_scale = outer_scale(matrix)?;
+            for row in 0..rows {
+                let code_row = matrix * metadata.code_matrix_stride() + row * metadata.code_row_stride();
+                let output_row = (matrix * rows + row) * columns;
+                for column in 0..columns {
+                    let packed = source_codes[code_row + column / 2];
+                    let code = if column.is_multiple_of(2) {
+                        packed & 0x0f
+                    } else {
+                        packed >> 4
+                    };
+                    codes_out[output_row + column] = e2m1_to_exact_i8(code);
+                }
+
+                let scale_row = matrix * metadata.scale_matrix_stride() + row * groups_per_row;
+                let output_scale_row = (matrix * rows + row) * groups_per_row;
+                for group in 0..groups_per_row {
+                    scales_out[output_scale_row + group] =
+                        mxfp4_exact_int8_scale(source_scales[scale_row + group], outer_scale);
+                }
+            }
+        }
+
+        Ok(DerivedInt8Bank {
+            codes,
+            scales,
+            group_size: metadata.group_size(),
+            statistics: DerivedInt8BankStatistics {
+                source_code_bytes: metadata.required_code_bytes(),
+                source_scale_bytes: metadata.required_scale_bytes()
+                    + metadata.matrix_count() as usize * microfloat.outer_scale_data_type.size_in_bytes(),
+                derived_code_bytes: code_count,
+                derived_scale_bytes: scale_bytes,
+                group_count: scale_count,
+            },
+        })
     }
 
     pub fn make_codes_signed(&mut self) {
@@ -505,3 +658,7 @@ mod tests {
         tree.assert_all_tensors_validated().expect("validate dense MXFP4 tensors");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/encodable_block/weight_matrix_int8_test.rs"]
+mod int8_tests;

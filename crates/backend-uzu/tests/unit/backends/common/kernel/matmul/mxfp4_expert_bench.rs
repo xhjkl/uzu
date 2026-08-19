@@ -13,15 +13,16 @@ use crate::{
     array::ArrayElement,
     backends::{
         common::{
-            Backend, Kernels,
+            Backend, Encoder, Kernels,
             kernel::matmul::{
                 ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
                 MatmulKernel, MatmulRouting,
             },
             microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
         },
-        metal::{Metal, MetalContext},
+        metal::{Metal, MetalContext, ResidentInt8ExpertTensorOpsDispatch},
     },
+    data_type::DataType,
     tests::{
         helpers::{alloc_allocation, alloc_allocation_with_data},
         matmul::iter_encode_loop,
@@ -74,6 +75,136 @@ impl Mxfp4RouteDistribution {
             })
             .collect()
     }
+}
+
+fn bench_resident_exact_int8_w2(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    context: &MetalContext,
+    shape: &Mxfp4Shape,
+    expert_ids_value: &[i32],
+    ids_label: &str,
+) {
+    if !context.supports_int8_tensorops() {
+        return;
+    }
+    assert_eq!(shape.group_size, 32);
+    assert!(!shape.input_is_bf16);
+    let routes = shape.routes as usize;
+    let experts = shape.experts as usize;
+    let (n, k) = (shape.n as usize, shape.k as usize);
+    let group_count = k / 32;
+
+    let mut weight_codes = alloc_allocation::<Metal, i8>(context, experts * n * k);
+    for (index, code) in weight_codes.as_slice_mut::<i8>().iter_mut().enumerate() {
+        *code = if index.is_multiple_of(2) {
+            -8
+        } else {
+            1
+        };
+    }
+    let mut weight_scales = alloc_allocation::<Metal, f32>(context, experts * n * group_count);
+    weight_scales.as_slice_mut::<f32>().fill(0.5);
+    let activation_values: Vec<f32> = (0..routes * k).map(|index| ((index as f32) * 0.03125).sin() * 7.0).collect();
+    let activations = alloc_allocation_with_data::<Metal, f32>(context, &activation_values);
+    let mut activation_codes = alloc_allocation::<Metal, i8>(context, routes * k);
+    let mut activation_scales = alloc_allocation::<Metal, f32>(context, routes * group_count);
+    let expert_ids = alloc_allocation_with_data::<Metal, i32>(context, expert_ids_value);
+    let biases = alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(0.0); experts * n]);
+    let mut output = alloc_allocation::<Metal, bf16>(context, routes * n);
+    let quantizer = crate::backends::common::kernel::ActivationTransform::<Metal>::quantize_symmetric_plain(
+        context,
+        DataType::F32,
+        32,
+    )
+    .expect("plain symmetric W2 quantizer");
+    let mut tensorops = ResidentInt8ExpertTensorOpsDispatch::new(DataType::BF16, DataType::BF16);
+    let routes_per_token = NonZeroU32::new(shape.routes).unwrap();
+    let expert_count = NonZeroU32::new(shape.experts).unwrap();
+
+    {
+        let mut encoder = Encoder::<Metal>::new(context).expect("W2 resident-control preparation");
+        quantizer.encode_quantize_symmetric_plain(
+            &activations,
+            &mut activation_codes,
+            &mut activation_scales,
+            shape.routes,
+            shape.k,
+            &mut encoder,
+        );
+        encoder.end_encoding().submit().wait_until_completed().expect("W2 activation preparation");
+    }
+
+    let label = format!("{}_{}", shape.label, ids_label);
+    let resident_weight_bytes = shape.routes as u64 * shape.n as u64 * (shape.k as u64 + shape.k as u64 / 32 * 4);
+    group.throughput(Throughput::Bytes(resident_weight_bytes));
+    group.bench_function(BenchmarkId::new("resident_int8_tensorops_projection", &label), |bencher| {
+        iter_encode_loop::<Metal, _>(context, bencher, |encoder| {
+            tensorops
+                .encode(
+                    &weight_codes,
+                    &weight_scales,
+                    &activation_codes,
+                    &activation_scales,
+                    &mut output,
+                    Some(&biases),
+                    &expert_ids,
+                    shape.k,
+                    shape.n,
+                    shape.routes,
+                    routes_per_token,
+                    expert_count,
+                    ExpertInput::Routes,
+                    encoder,
+                )
+                .expect("resident W2 TensorOps");
+        });
+    });
+
+    group.throughput(Throughput::Elements((shape.routes * shape.k) as u64));
+    group.bench_function(BenchmarkId::new("plain_activation_quantization", &label), |bencher| {
+        iter_encode_loop::<Metal, _>(context, bencher, |encoder| {
+            quantizer.encode_quantize_symmetric_plain(
+                &activations,
+                &mut activation_codes,
+                &mut activation_scales,
+                shape.routes,
+                shape.k,
+                encoder,
+            );
+        });
+    });
+
+    group.throughput(Throughput::Bytes(resident_weight_bytes));
+    group.bench_function(BenchmarkId::new("resident_int8_tensorops_including_quantization", &label), |bencher| {
+        iter_encode_loop::<Metal, _>(context, bencher, |encoder| {
+            quantizer.encode_quantize_symmetric_plain(
+                &activations,
+                &mut activation_codes,
+                &mut activation_scales,
+                shape.routes,
+                shape.k,
+                encoder,
+            );
+            tensorops
+                .encode(
+                    &weight_codes,
+                    &weight_scales,
+                    &activation_codes,
+                    &activation_scales,
+                    &mut output,
+                    Some(&biases),
+                    &expert_ids,
+                    shape.k,
+                    shape.n,
+                    shape.routes,
+                    routes_per_token,
+                    expert_count,
+                    ExpertInput::Routes,
+                    encoder,
+                )
+                .expect("resident W2 TensorOps with quantization");
+        });
+    });
 }
 
 fn mxfp4_expert_bytes(shape: &Mxfp4Shape) -> u64 {
@@ -245,6 +376,8 @@ fn bench_mxfp4_expert_decode_production(c: &mut Criterion) {
         bench_mxfp4_expert_projection(&mut group, context, shape, &spread_ids, "spread");
         bench_mxfp4_expert_projection(&mut group, context, shape, &fixed_ids, "fixed");
     }
+    bench_resident_exact_int8_w2(&mut group, context, &W2, &spread_ids, "spread");
+    bench_resident_exact_int8_w2(&mut group, context, &W2, &fixed_ids, "fixed");
 
     // Fused W13: identical weight traffic, gate/up epilogue folded in, output
     // is the activated hidden half-width (routes x 2880 F32).

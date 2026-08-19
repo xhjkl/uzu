@@ -37,6 +37,15 @@ pub enum MicrofloatError {
     },
     #[error("microfloat storage size overflows usize")]
     SizeOverflow,
+    #[error("E8M0 exponent 255 is invalid")]
+    InvalidE8M0Exponent,
+    #[error("INT32 accumulator bound exceeds INT32_MAX: {left_max_abs} * {right_max_abs} * {length} = {bound}")]
+    Int32AccumulatorOverflow {
+        left_max_abs: u32,
+        right_max_abs: u32,
+        length: u32,
+        bound: u128,
+    },
 }
 
 /// Packed E2M1 values with per-group E8M0 scales.
@@ -178,6 +187,13 @@ pub fn decode_e2m1(code: u8) -> f32 {
     VALUES[usize::from(code & 0x0f)]
 }
 
+/// Exact signed-integer representation of one E2M1 nibble at scale 0.5.
+#[inline]
+pub fn e2m1_to_exact_i8(code: u8) -> i8 {
+    const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    VALUES[usize::from(code & 0x0f)]
+}
+
 #[inline]
 pub fn decode_e8m0(exponent: u8) -> f32 {
     match exponent {
@@ -196,6 +212,33 @@ pub fn decode_mxfp4(
     decode_e2m1(code) * decode_e8m0(exponent) * outer_scale
 }
 
+/// FP32 scale paired with [`e2m1_to_exact_i8`] for one MXFP4 block.
+#[inline]
+pub fn mxfp4_exact_int8_scale(
+    exponent: u8,
+    outer_scale: f32,
+) -> f32 {
+    decode_e8m0(exponent) * outer_scale * 0.5
+}
+
+/// Proves that one signed dot-product partial fits its INT32 accumulator.
+pub fn check_int32_accumulator_bound(
+    left_max_abs: u32,
+    right_max_abs: u32,
+    length: u32,
+) -> Result<u32, MicrofloatError> {
+    let bound = u128::from(left_max_abs) * u128::from(right_max_abs) * u128::from(length);
+    if bound > i32::MAX as u128 {
+        return Err(MicrofloatError::Int32AccumulatorOverflow {
+            left_max_abs,
+            right_max_abs,
+            length,
+            bound,
+        });
+    }
+    Ok(bound as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use proc_macros::uzu_test;
@@ -212,6 +255,43 @@ mod tests {
         assert_eq!(decode_e8m0(0).to_bits(), 0x0040_0000);
         assert_eq!(decode_e8m0(127), 1.0);
         assert!(decode_e8m0(255).is_nan());
+    }
+
+    #[uzu_test]
+    fn derives_exact_mxfp4_int8_representation() {
+        let expected = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+        for (code, expected) in expected.into_iter().enumerate() {
+            assert_eq!(e2m1_to_exact_i8(code as u8), expected);
+        }
+
+        for (exponent, outer_scales) in [
+            (0, &[1.0, -1.0][..]),
+            (1, &[1.0, -1.0, 0.75, -0.75][..]),
+            (127, &[1.0, -1.0, 0.75, -0.75][..]),
+            (254, &[1.0, -1.0][..]),
+        ] {
+            for &outer_scale in outer_scales {
+                for code in 0..16 {
+                    let original = decode_mxfp4(code, exponent, outer_scale);
+                    let derived = f32::from(e2m1_to_exact_i8(code)) * mxfp4_exact_int8_scale(exponent, outer_scale);
+                    if code == 8 {
+                        assert_eq!(original, derived);
+                    } else {
+                        assert_eq!(original.to_bits(), derived.to_bits(), "code={code}, exponent={exponent}");
+                    }
+                }
+            }
+        }
+        assert!(mxfp4_exact_int8_scale(255, 1.0).is_nan());
+    }
+
+    #[uzu_test]
+    fn checks_int32_accumulator_bounds() {
+        assert_eq!(check_int32_accumulator_bound(127, 12, 32), Ok(48_768));
+        assert!(matches!(
+            check_int32_accumulator_bound(127, 127, 1_000_000),
+            Err(MicrofloatError::Int32AccumulatorOverflow { .. })
+        ));
     }
 
     #[uzu_test]

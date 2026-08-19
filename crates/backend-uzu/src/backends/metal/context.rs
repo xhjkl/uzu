@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -23,12 +23,16 @@ use super::{
     error::MetalError,
     metal_extensions::{DeviceExt, LibraryPipelineExtensions},
 };
-use crate::backends::{
-    common::{Allocation, AllocationPool, AllocationType, Allocator, Backend, Context, DeviceCapabilities},
-    metal::{
-        command_buffer::MetalCommandBufferInitial,
-        sparse::{MetalSparseBuffer, MetalSparseHeapPool, MetalSparseMappingOpsBatch},
+use crate::{
+    backends::{
+        common::{Allocation, AllocationPool, AllocationType, Allocator, Backend, Context, DeviceCapabilities},
+        metal::{
+            command_buffer::MetalCommandBufferInitial,
+            kernel::ResidentInt8ExpertTensorOpsMetalKernel,
+            sparse::{MetalSparseBuffer, MetalSparseHeapPool, MetalSparseMappingOpsBatch},
+        },
     },
+    data_type::DataType,
 };
 
 pub struct MetalContext {
@@ -44,6 +48,8 @@ pub struct MetalContext {
     pipeline_cache: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
     sparse_heap_pool: Mutex<MetalSparseHeapPool>,
     device_profile: DeviceProfile,
+    /// M5 INT8 TensorOps availability, proven by pipeline creation once.
+    int8_tensorops: OnceLock<bool>,
     weak_self: Weak<MetalContext>,
     #[cfg(test)]
     timeline_shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -83,6 +89,16 @@ impl TimelineState {
 impl MetalContext {
     pub fn supports_mxu(&self) -> bool {
         self.device.supports_mxu()
+    }
+
+    /// Whether the device accepts the resident signed-INT8 TensorOps kernel.
+    pub fn supports_int8_tensorops(&self) -> bool {
+        if !self.supports_mxu() {
+            return false;
+        }
+        *self.int8_tensorops.get_or_init(|| {
+            ResidentInt8ExpertTensorOpsMetalKernel::new(self, DataType::F32, DataType::F32, false).is_ok()
+        })
     }
 
     pub fn device_profile(&self) -> DeviceProfile {
@@ -229,6 +245,7 @@ impl Context for MetalContext {
             pipeline_cache: Mutex::new(HashMap::new()),
             sparse_heap_pool: Mutex::new(sparse_pool),
             device_profile,
+            int8_tensorops: OnceLock::new(),
             weak_self: weak_self.clone(),
             #[cfg(test)]
             timeline_shared_event,
@@ -322,6 +339,9 @@ impl Context for MetalContext {
         let mut capabilities = DeviceCapabilities::empty();
         if self.device.supports_placement_sparse_resources() {
             capabilities |= DeviceCapabilities::SPARSE_BUFFERS;
+        }
+        if self.supports_int8_tensorops() {
+            capabilities |= DeviceCapabilities::INT8_TENSOROPS;
         }
         capabilities
     }

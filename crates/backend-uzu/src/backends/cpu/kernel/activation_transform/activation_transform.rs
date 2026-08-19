@@ -47,12 +47,20 @@ pub fn activation_transform<T: ArrayElement + Float>(
     #[optional(ops == ActivationTransformOp::InputRht || ops == ActivationTransformOp::OutputRht)] fp_out: Option<
         *mut T,
     >,
-    #[optional(ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums)]
+    #[optional(
+        ops == ActivationTransformOp::Quantize
+            || ops == ActivationTransformOp::QuantizeWithGroupSums
+            || ops == ActivationTransformOp::QuantizeSymmetricPlain
+    )]
     q_out: Option<*mut i8>,
-    #[optional(ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums)]
+    #[optional(
+        ops == ActivationTransformOp::Quantize
+            || ops == ActivationTransformOp::QuantizeWithGroupSums
+            || ops == ActivationTransformOp::QuantizeSymmetricPlain
+    )]
     scales_out: Option<*mut f32>,
     #[optional(ops == ActivationTransformOp::QuantizeWithGroupSums)] group_sums_out: Option<*mut i32>,
-    rht_factors: *const i32,
+    #[optional(ops != ActivationTransformOp::QuantizeSymmetricPlain)] rht_factors: Option<*const i32>,
     batch_size: u32,
     element_count: u32,
     #[specialize] ops: ActivationTransformOp,
@@ -67,34 +75,48 @@ pub fn activation_transform<T: ArrayElement + Float>(
     let rows = batch_size as usize;
     let columns = element_count as usize;
     let input_rht = ops != ActivationTransformOp::OutputRht;
-    let quantize = matches!(ops, ActivationTransformOp::Quantize | ActivationTransformOp::QuantizeWithGroupSums);
+    let plain = ops == ActivationTransformOp::QuantizeSymmetricPlain;
+    let quantize = matches!(
+        ops,
+        ActivationTransformOp::Quantize
+            | ActivationTransformOp::QuantizeWithGroupSums
+            | ActivationTransformOp::QuantizeSymmetricPlain
+    );
+    assert_eq!(rht_factors.is_none(), plain);
 
     let mut transformed = vec![0.0f32; columns];
     for row in 0..rows {
         let row_offset = row * columns;
-        for stripe_start in (0..columns).step_by(HADAMARD_TRANSFORM_BLOCK_SIZE as usize) {
-            let mut stripe = [0.0f32; HADAMARD_TRANSFORM_BLOCK_SIZE as usize];
-            for lane in 0..HADAMARD_TRANSFORM_BLOCK_SIZE as usize {
-                let index = stripe_start + lane;
-                let value: f32 = NumCast::from(unsafe { *input.add(row_offset + index) }).unwrap();
-                let factor = unsafe { *rht_factors.add(index) } as f32;
-                stripe[lane] = if input_rht {
-                    value * factor
-                } else {
-                    value
-                };
+        if plain {
+            for (index, transformed) in transformed.iter_mut().enumerate() {
+                *transformed = NumCast::from(unsafe { *input.add(row_offset + index) }).unwrap();
             }
+        } else {
+            let rht_factors = rht_factors.expect("RHT operation requires factors");
+            for stripe_start in (0..columns).step_by(HADAMARD_TRANSFORM_BLOCK_SIZE as usize) {
+                let mut stripe = [0.0f32; HADAMARD_TRANSFORM_BLOCK_SIZE as usize];
+                for lane in 0..HADAMARD_TRANSFORM_BLOCK_SIZE as usize {
+                    let index = stripe_start + lane;
+                    let value: f32 = NumCast::from(unsafe { *input.add(row_offset + index) }).unwrap();
+                    let factor = unsafe { *rht_factors.add(index) } as f32;
+                    stripe[lane] = if input_rht {
+                        value * factor
+                    } else {
+                        value
+                    };
+                }
 
-            hadamard_transform(&mut stripe);
+                hadamard_transform(&mut stripe);
 
-            for lane in 0..HADAMARD_TRANSFORM_BLOCK_SIZE as usize {
-                let index = stripe_start + lane;
-                let factor = unsafe { *rht_factors.add(index) } as f32;
-                transformed[index] = if input_rht {
-                    stripe[lane]
-                } else {
-                    stripe[lane] * factor
-                };
+                for lane in 0..HADAMARD_TRANSFORM_BLOCK_SIZE as usize {
+                    let index = stripe_start + lane;
+                    let factor = unsafe { *rht_factors.add(index) } as f32;
+                    transformed[index] = if input_rht {
+                        stripe[lane]
+                    } else {
+                        stripe[lane] * factor
+                    };
+                }
             }
         }
 
