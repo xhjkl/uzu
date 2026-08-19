@@ -8,8 +8,8 @@ const SMALL_APPLE9: DeviceProfile = DeviceProfile::new(10, DeviceGeneration::App
 const SMALL_APPLE8: DeviceProfile = DeviceProfile::new(10, DeviceGeneration::Apple8);
 const SMALL_LEGACY: DeviceProfile = DeviceProfile::new(8, DeviceGeneration::Legacy);
 const SMALL_M5: DeviceProfile = DeviceProfile::new(10, DeviceGeneration::M5Plus);
-/// 32-core M1 Max: Legacy generation on a Large die, so the G13 rules must not fire.
 const LARGE_LEGACY: DeviceProfile = DeviceProfile::new(32, DeviceGeneration::Legacy);
+const LARGE_LEGACY_ULTRA: DeviceProfile = DeviceProfile::new(64, DeviceGeneration::Legacy);
 
 #[uzu_test]
 fn fp_policy_cases() {
@@ -25,6 +25,13 @@ fn fp_policy_cases() {
         (SMALL_LEGACY, 1, 262144, 1536, true, tile(8, 1, 4)),
         (LARGE_LEGACY, 1, 262144, 1536, true, tile(8, 8, 1)),
         (LARGE_LEGACY, 1,   6144, 1536, true, tile(8, 8, 1)),
+        (LARGE_LEGACY, 1, 201088, 2880, false, tile(8, 1, 2)),
+        (LARGE_LEGACY, 1, 201088, 2880, true,  tile(8, 1, 2)),
+        (LARGE_LEGACY, 1,   5120, 2880, true,  tile(8, 1, 2)),
+        (LARGE_LEGACY, 1,   2880, 4096, true,  tile(8, 1, 2)),
+        (LARGE_LEGACY, 1,   4096, 2880, true,  tile(8, 8, 1)),
+        (LARGE_LEGACY_ULTRA, 1, 5120, 2880, true, tile(8, 8, 1)),
+        (LARGE,        1,   5120, 2880, false, tile(8, 1, 1)),
     ];
 
     for (profile, m, n, k, aligned, expected) in cases {
