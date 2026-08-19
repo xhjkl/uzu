@@ -71,11 +71,6 @@ pub enum MoeBlockError<B: Backend> {
     UnsupportedNoBiases,
     #[error("Unsupported MoE router configuration: {0}")]
     UnsupportedRouterConfiguration(String),
-    #[error("Unsupported MoE {projection} weight configuration: {spec}")]
-    UnsupportedExpertWeightConfiguration {
-        projection: &'static str,
-        spec: String,
-    },
     #[error("Unsupported MoE expert activation: {0:?}")]
     UnsupportedExpertActivation(ActivationType),
 }
@@ -160,12 +155,6 @@ impl<B: Backend> MoeBlock<B> {
         let down_tree = experts_tree.subtree("down_projection");
         let up_weights_tree = up_tree.subtree("weights");
         let up_spec = Self::expert_spec(&up_weights_tree)?;
-        if !matches!(&up_spec, AnyWeightMatrixSpec::FullPrecisionSpec(_) | AnyWeightMatrixSpec::MicrofloatSpec(_)) {
-            return Err(MoeBlockError::UnsupportedExpertWeightConfiguration {
-                projection: "up-projection",
-                spec: format!("{up_spec:?}"),
-            });
-        }
         let up_projection = WeightMatrix::load_bank(
             &up_weights_tree,
             up_spec,
@@ -177,12 +166,6 @@ impl<B: Backend> MoeBlock<B> {
         )?;
         let down_weights_tree = down_tree.subtree("weights");
         let down_spec = Self::expert_spec(&down_weights_tree)?;
-        if !matches!(&down_spec, AnyWeightMatrixSpec::FullPrecisionSpec(_) | AnyWeightMatrixSpec::MicrofloatSpec(_)) {
-            return Err(MoeBlockError::UnsupportedExpertWeightConfiguration {
-                projection: "down-projection",
-                spec: format!("{down_spec:?}"),
-            });
-        }
         let down_projection = WeightMatrix::load_bank(
             &down_weights_tree,
             down_spec,
