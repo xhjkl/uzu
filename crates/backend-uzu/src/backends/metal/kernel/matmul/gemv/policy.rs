@@ -24,6 +24,7 @@ const FP_LARGE_SPLIT_K_MIN_DEPTH: u32 = 4 * FP_K_BLOCK;
 const FP_K_DEPTH_N_MAX: u32 = 4095;
 const FP_K_DEPTH_DEEP_MIN: u32 = 3072;
 const FP_K_DEPTH_VERY_DEEP_RATIO: u32 = 16;
+const GPT_OSS_20B_DECODE_SHAPES: [(u32, u32); 3] = [(201088, 2880), (5120, 2880), (2880, 4096)];
 
 const fn tile(
     num_simdgroups: u32,
@@ -128,6 +129,15 @@ pub(crate) fn fp_tile(
 ) -> GemvTile {
     let size = profile.size();
     let is_small_g13 = size == DeviceSize::Small && profile.generation() == DeviceGeneration::Legacy;
+
+    if m == 1
+        && profile.generation() == DeviceGeneration::Legacy
+        && (30..=32).contains(&profile.gpu_core_count())
+        && GPT_OSS_20B_DECODE_SHAPES.contains(&(n, k))
+    {
+        return tile(DEFAULT_NUM_SIMDGROUPS, 1, 2);
+    }
+
     // FP sweeps covered SG2/SG4/SG8; SG changes did not produce portable
     // confirmed wins, so shipped FP policy keeps SG8 and tunes KS/R only.
     let should_disable_k_split = !input_aligned
