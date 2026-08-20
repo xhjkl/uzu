@@ -15,7 +15,8 @@ use crate::{
         common::{
             Backend, Kernels,
             kernel::matmul::{
-                ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting,
+                ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
+                MatmulKernel, MatmulRouting,
             },
             microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
         },
@@ -106,6 +107,7 @@ fn bench_mxfp4_expert_projection(
     )
     .unwrap();
     let expert_ids = alloc_allocation_with_data::<Metal, i32>(context, expert_ids_value);
+    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<Metal, u8>(context, routes * n * 4);
     let routes_per_token = NonZeroU32::new(shape.routes_per_token).unwrap();
     let expert_count = NonZeroU32::new(shape.experts).unwrap();
@@ -145,6 +147,7 @@ fn bench_mxfp4_expert_projection(
                                 ..MatmulDOps::none()
                             },
                             routing: MatmulRouting::Experts(ExpertRoutes {
+                                identity: &route_identity,
                                 expert_ids: &expert_ids,
                                 routes_per_token,
                                 expert_count,
@@ -192,6 +195,7 @@ fn bench_mxfp4_expert_projection(
                                 ..MatmulDOps::none()
                             },
                             routing: MatmulRouting::Experts(ExpertRoutes {
+                                identity: &route_identity,
                                 expert_ids: &expert_ids,
                                 routes_per_token,
                                 expert_count,
@@ -265,6 +269,7 @@ fn bench_mxfp4_expert_decode_production(c: &mut Criterion) {
         )
         .unwrap();
         let expert_ids = alloc_allocation_with_data::<Metal, i32>(context, &spread_ids);
+        let route_identity = ExpertRouteIdentity::new();
         let input = alloc_allocation::<Metal, bf16>(context, k);
         let mut output = alloc_allocation::<Metal, u8>(context, routes * hidden * 4);
         let routes_per_token = NonZeroU32::new(W13.routes).unwrap();
@@ -306,6 +311,7 @@ fn bench_mxfp4_expert_decode_production(c: &mut Criterion) {
                                 ..MatmulDOps::none()
                             },
                             routing: MatmulRouting::Experts(ExpertRoutes {
+                                identity: &route_identity,
                                 expert_ids: &expert_ids,
                                 routes_per_token,
                                 expert_count,
@@ -357,13 +363,7 @@ fn bench_mxfp4_expert_prefill_production(c: &mut Criterion) {
     ] {
         let expert_ids = distribution.expert_ids(W13.routes, W13.experts);
         for shape in [&W13, &W2] {
-            bench_mxfp4_expert_projection(
-                &mut group,
-                context,
-                shape,
-                &expert_ids,
-                distribution.label(),
-            );
+            bench_mxfp4_expert_projection(&mut group, context, shape, &expert_ids, distribution.label());
         }
     }
 }

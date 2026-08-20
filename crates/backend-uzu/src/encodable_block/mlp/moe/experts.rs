@@ -116,6 +116,7 @@ impl<B: Backend> MoeExperts<B> {
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
+                    identity: &routes.identity,
                     expert_ids: &routes.expert_ids,
                     routes_per_token: routes.routes_per_token,
                     expert_count: std::num::NonZeroU32::new(self.expert_count)
@@ -144,6 +145,7 @@ impl<B: Backend> MoeExperts<B> {
     ) -> Result<Allocation<B>, B::Error> {
         let route_count = routes.route_count();
         let route_metadata = |input| ExpertRoutes {
+            identity: &routes.identity,
             expert_ids: &routes.expert_ids,
             routes_per_token: routes.routes_per_token,
             expert_count: std::num::NonZeroU32::new(self.expert_count).expect("MoeBlock validates expert_count"),

@@ -180,16 +180,12 @@ impl RowTiledGemm {
         let expert_count = routes.map_or(1, |routes| routes.expert_count.get());
         let route_count = arguments.m;
         let (route_plan_key, route_plan, cache_route_plan) = if let Some(routes) = routes {
-            let route_plan_key = MetalRoutePlanKey::new(
-                routes.expert_ids,
-                route_count,
-                expert_count,
-                routes.routes_per_token.get(),
-            );
-            let route_plan = encoder.as_command_buffer_mut().take_route_plan(route_plan_key);
+            let route_plan_key =
+                MetalRoutePlanKey::new(routes.identity, route_count, expert_count, routes.routes_per_token.get());
+            let route_plan = encoder.as_command_buffer_mut().take_route_plan(&route_plan_key);
             let (route_plan, cache_route_plan) = match route_plan {
                 // W2 consumes the plan produced for W13. Do not reinsert it:
-                // the next layer has a distinct TopK allocation identity.
+                // the next layer has a distinct route identity.
                 Some(route_plan) => (route_plan, false),
                 None => {
                     let mut offsets = encoder

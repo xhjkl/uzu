@@ -72,9 +72,9 @@ enum MetalCommandBufferEncodingEncodingState {
 }
 
 /// Identity of direct routes whose backend-private grouping is reusable in one command buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct MetalRoutePlanKey {
-    expert_ids_allocation: usize,
+    routes: crate::backends::common::kernel::matmul::ExpertRouteIdentity,
     route_count: u32,
     expert_count: u32,
     routes_per_token: u32,
@@ -82,13 +82,13 @@ pub(super) struct MetalRoutePlanKey {
 
 impl MetalRoutePlanKey {
     pub(super) fn new(
-        expert_ids: &Allocation<Metal>,
+        routes: &crate::backends::common::kernel::matmul::ExpertRouteIdentity,
         route_count: u32,
         expert_count: u32,
         routes_per_token: u32,
     ) -> Self {
         Self {
-            expert_ids_allocation: expert_ids.allocation_id(),
+            routes: routes.clone(),
             route_count,
             expert_count,
             routes_per_token,
@@ -98,8 +98,8 @@ impl MetalRoutePlanKey {
 
 /// One-shot Metal route grouping handed from W13 to W2 for the same immutable IDs.
 ///
-/// Unconsumed plans may live to the end of encoding. Allocation identities keep
-/// them distinct even when the scratch allocator recycles the same GPU address.
+/// Unconsumed plans may live to the end of encoding. Retained route identities
+/// keep them distinct even when scratch storage is recycled.
 pub(super) struct MetalRoutePlan {
     pub(super) offsets: Allocation<Metal>,
     pub(super) grouped_routes: Allocation<Metal>,
@@ -116,9 +116,9 @@ pub struct MetalCommandBufferEncoding {
 impl MetalCommandBufferEncoding {
     pub(super) fn take_route_plan(
         &mut self,
-        key: MetalRoutePlanKey,
+        key: &MetalRoutePlanKey,
     ) -> Option<MetalRoutePlan> {
-        self.route_plans.remove(&key)
+        self.route_plans.remove(key)
     }
 
     pub(super) fn insert_route_plan(
