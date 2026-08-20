@@ -146,6 +146,12 @@ fn encode_mxfp4_moe(
     encoder: &mut Encoder<Metal>,
 ) {
     let route_count = token_count * routes_per_token.get();
+    let w13: MatmulB<'_, Metal> = MatmulB::Microfloat {
+        codes: w13_codes,
+        scales: w13_scales,
+        outer_scales: w13_outer_scales,
+        metadata: w13_metadata,
+    };
     w13_kernel
         .encode(
             MatmulArguments {
@@ -153,12 +159,7 @@ fn encode_mxfp4_moe(
                     values: input,
                     offset: 0,
                 },
-                b: MatmulB::Microfloat {
-                    codes: w13_codes,
-                    scales: w13_scales,
-                    outer_scales: w13_outer_scales,
-                    metadata: w13_metadata,
-                },
+                b: w13,
                 b_leading_dimension: None,
                 b_transpose: true,
                 d: fused_up,
@@ -192,6 +193,12 @@ fn encode_mxfp4_moe(
         ActivationType::SILU,
         encoder,
     );
+    let w2: MatmulB<'_, Metal> = MatmulB::Microfloat {
+        codes: w2_codes,
+        scales: w2_scales,
+        outer_scales: w2_outer_scales,
+        metadata: w2_metadata,
+    };
     w2_kernel
         .encode(
             MatmulArguments {
@@ -199,12 +206,7 @@ fn encode_mxfp4_moe(
                     values: hidden,
                     offset: 0,
                 },
-                b: MatmulB::Microfloat {
-                    codes: w2_codes,
-                    scales: w2_scales,
-                    outer_scales: w2_outer_scales,
-                    metadata: w2_metadata,
-                },
+                b: w2,
                 b_leading_dimension: None,
                 b_transpose: true,
                 d: route_outputs,
