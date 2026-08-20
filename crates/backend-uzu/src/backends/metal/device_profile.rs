@@ -1,10 +1,7 @@
 //TODO: remove after retune with gpu core counts
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceSize {
-    /// Below Max/Ultra class: base and Pro dies, plus Max parts binned under
-    /// the core-count cutoff (a 24-core M1 Max lands here, a 32-core one does not).
     Small,
-    /// Max/Ultra-class GPUs, currently classified by >= 30 GPU cores.
     Large,
 }
 
