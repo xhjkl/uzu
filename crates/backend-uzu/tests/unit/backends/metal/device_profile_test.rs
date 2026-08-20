@@ -13,7 +13,6 @@ fn device_profile_detection() {
 
 #[uzu_test]
 fn size_derives_from_core_count() {
-    // M1 Max ships in two bins that straddle the cutoff, on identical silicon.
     assert_eq!(classify_device(24, false, false, false).size(), DeviceSize::Small);
     assert_eq!(classify_device(32, false, false, false).size(), DeviceSize::Large);
     assert_eq!(classify_device(8, false, false, false).gpu_core_count(), 8);

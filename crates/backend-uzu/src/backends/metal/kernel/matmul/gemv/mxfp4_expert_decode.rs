@@ -22,12 +22,6 @@ use crate::{
 /// kernel; larger route counts stay on the generic path.
 pub(crate) const MXFP4_EXPERT_DECODE_MAX_ROUTES: u32 = 8;
 
-/// Measured on M1 Max (perf-20260819, sweep-mxfp4-2/3 over
-/// {2,4} simdgroups x {1,2,4,8} rows): 4 simdgroups x 4 rows wins for both
-/// production projections — fused W13 237.4 us (next-best 272.1 at 2x1) and
-/// routed W2 120.6 us (monotone in rows up to 4; 8 rows regresses to 139.2
-/// from register pressure). W13 and W2 prefer the same tile, so one entry
-/// covers both; split per projection/device only when new measurements say so.
 fn mxfp4_decode_tile(profile: DeviceProfile) -> (u32, u32) {
     let measured_m1_max =
         profile.generation() == DeviceGeneration::Legacy && (30..=32).contains(&profile.gpu_core_count());

@@ -131,14 +131,6 @@ pub(crate) fn fp_tile(
     let size = profile.size();
     let is_small_g13 = size == DeviceSize::Small && profile.generation() == DeviceGeneration::Legacy;
 
-    // GPT-OSS-20B decode projections, measured on M1 Max (perf-20260819
-    // sweep-fp-2 + clean interleaved re-run sweep-fp-3): sg8 ks1 r2 wins all
-    // three production shapes — LM head N201088 K2880 3.10 vs 3.92 ms (r1),
-    // QKVG N5120 K2880 51 vs 64 us (r1), AttnO N2880 K4096 37-44 vs 50-57 us.
-    // Split-K loses even with a 128-aligned K (ks8: 49-57 us): at m=1 the
-    // N axis alone saturates a Large die, and r2 streams two weight rows per
-    // simdgroup pass. Scoped to the measured device class and decode regime;
-    // other profiles keep the fleet policy until swept.
     if m == 1
         && profile.generation() == DeviceGeneration::Legacy
         && (30..=32).contains(&profile.gpu_core_count())
