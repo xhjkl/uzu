@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 
 use super::router::MoeRoutes;
 use crate::{
+    ClippingBounds,
     backends::common::{
         Allocation, Backend, Encoder, Kernels,
         kernel::{
@@ -41,8 +42,8 @@ impl<B: Backend> MoeExperts<B> {
         hidden_dim: u32,
         expert_count: u32,
         activation: AnyActivation,
-        gate_clipping: Option<(Option<f32>, Option<f32>)>,
-        up_clipping: Option<(Option<f32>, Option<f32>)>,
+        gate_clipping: ClippingBounds,
+        up_clipping: ClippingBounds,
         data_type: DataType,
     ) -> Result<Self, B::Error> {
         Ok(Self {
