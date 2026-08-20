@@ -117,6 +117,12 @@ impl RowTiledGemm {
         arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
         encoder: &mut Encoder<Metal>,
     ) -> Result<(), MatmulError<Metal>> {
+        if arguments.routing.sparse_readout_rows().is_some() {
+            return Err(MatmulError::UnsupportedRouting {
+                path: "RowTiledGemm",
+                reason: "row-tiled GEMM does not support sparse readout rows",
+            });
+        }
         let output_transform = arguments.d_transform.mask();
         if output_transform.intersects(GemmDTransform::ACCUMULATE | GemmDTransform::RHT) {
             return Err(MatmulError::UnsupportedRouting {

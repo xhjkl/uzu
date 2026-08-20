@@ -271,12 +271,14 @@ fn run_dense<B: Backend>(
     (actual, expected)
 }
 
-fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
-    const INPUT_ROWS: usize = 9;
-    const READOUT_ROWS: usize = 4;
-    const VOCAB_ROWS: usize = 7;
+fn run_sparse_readout<B: Backend>(
+    group_size: u32,
+    input_rows: usize,
+    readout_row_count: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    const VOCAB_ROWS: usize = 11;
 
-    let input: Vec<f32> = (0..INPUT_ROWS * K).map(|index| (index % 17) as f32 * 0.0625 - 0.375).collect();
+    let input: Vec<f32> = (0..input_rows * K).map(|index| (index % 17) as f32 * 0.0625 - 0.375).collect();
     let codes: Vec<u8> = (0..VOCAB_ROWS * K / 2)
         .map(|index| {
             let row = index / (K / 2);
@@ -288,10 +290,14 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
     let scales: Vec<u8> =
         (0..VOCAB_ROWS * K / group_size as usize).map(|index| 124 + ((index * 3 + 1) % 5) as u8).collect();
     let outer_scales = [1.25f32];
-    let readout_rows: Vec<u32> = (0..INPUT_ROWS)
-        .flat_map(|row| {
-            let rows = [6, 1, 4, 1];
-            rows.map(|physical_row| ((physical_row + row * 2) % VOCAB_ROWS) as u32)
+    let readout_rows: Vec<u32> = (0..input_rows)
+        .flat_map(|input_row| {
+            // Reversed, repeated and non-contiguous rows expose accidental dense addressing.
+            let physical_rows = [10, 2, 7, 2, 5];
+            (0..readout_row_count).map(move |readout_row| {
+                let pattern_index = readout_row_count - readout_row - 1;
+                ((physical_rows[pattern_index] + input_row * 3) % VOCAB_ROWS) as u32
+            })
         })
         .collect();
     let metadata = MicrofloatMetadata::new(
@@ -311,7 +317,7 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
     let scales_alloc = alloc_allocation_with_data::<B, u8>(context.as_ref(), &scales);
     let outer_scales_alloc = alloc_allocation_with_data::<B, f32>(context.as_ref(), &outer_scales);
     let readout_rows_alloc = alloc_allocation_with_data::<B, u32>(context.as_ref(), &readout_rows);
-    let mut output = alloc_allocation::<B, f32>(context.as_ref(), INPUT_ROWS * READOUT_ROWS);
+    let mut output = alloc_allocation::<B, f32>(context.as_ref(), input_rows * readout_row_count);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
             .unwrap();
@@ -336,8 +342,8 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
                 routing: MatmulRouting::SparseReadout {
                     b_rows: &readout_rows_alloc,
                 },
-                m: INPUT_ROWS as u32,
-                n: READOUT_ROWS as u32,
+                m: input_rows as u32,
+                n: readout_row_count as u32,
                 k: K as u32,
             },
             &mut encoder,
@@ -346,10 +352,10 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
     encoder.end_encoding().submit().wait_until_completed().unwrap();
     let actual = allocation_to_vec::<B, f32>(&output);
 
-    let mut expected = vec![0.0f32; INPUT_ROWS * READOUT_ROWS];
-    for input_row in 0..INPUT_ROWS {
-        for readout_row in 0..READOUT_ROWS {
-            let physical_row = readout_rows[input_row * READOUT_ROWS + readout_row] as usize;
+    let mut expected = vec![0.0f32; input_rows * readout_row_count];
+    for input_row in 0..input_rows {
+        for readout_row in 0..readout_row_count {
+            let physical_row = readout_rows[input_row * readout_row_count + readout_row] as usize;
             for inner in 0..K {
                 let packed = codes[physical_row * K / 2 + inner / 2];
                 let code = if inner.is_multiple_of(2) {
@@ -359,7 +365,7 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
                 };
                 let scale_index = physical_row * K / group_size as usize + inner / group_size as usize;
                 let weight = decode_mxfp4(code, scales[scale_index], outer_scales[0]);
-                expected[input_row * READOUT_ROWS + readout_row] += input[input_row * K + inner] * weight;
+                expected[input_row * readout_row_count + readout_row] += input[input_row * K + inner] * weight;
             }
         }
     }
@@ -647,14 +653,18 @@ fn backends_execute_dense_microfloat_gemv_and_gemm() {
 }
 
 #[uzu_test]
-fn backends_honor_sparse_microfloat_rows_above_the_gemv_threshold() {
+fn backends_honor_sparse_microfloat_rows_across_selector_boundaries() {
     for group_size in [16, 32] {
-        let (cpu, expected) = run_sparse_readout::<Cpu>(group_size);
-        assert_eq_float(&expected, &cpu, 1e-5, "CPU sparse MXFP4 readout");
-        for_each_non_cpu_backend!(|B| {
-            let (actual, _) = run_sparse_readout::<B>(group_size);
-            assert_eq_float(&cpu, &actual, 1e-4, "Metal sparse MXFP4 readout");
-        });
+        for input_rows in [2, 9] {
+            for readout_rows in 1..=5 {
+                let (cpu, expected) = run_sparse_readout::<Cpu>(group_size, input_rows, readout_rows);
+                assert_eq_float(&expected, &cpu, 1e-5, "CPU sparse MXFP4 readout");
+                for_each_non_cpu_backend!(|B| {
+                    let (actual, _) = run_sparse_readout::<B>(group_size, input_rows, readout_rows);
+                    assert_eq_float(&cpu, &actual, 1e-4, "Metal sparse MXFP4 readout");
+                });
+            }
+        }
     }
 }
 

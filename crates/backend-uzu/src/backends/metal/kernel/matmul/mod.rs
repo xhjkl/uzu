@@ -7,7 +7,10 @@ mod routed;
 pub use self::gemm::GemmKernel;
 use self::{
     gemm::{GemmPlan, GemmProblem},
-    gemv::{GemvDispatch, GemvSpecialization, Mxfp4ExpertDecodeGemvDispatch, Mxfp4ExpertDecodeGemvSpec},
+    gemv::{
+        DEFAULT_GEMV_MAX_BATCH, GemvDispatch, GemvSpecialization, Mxfp4ExpertDecodeGemvDispatch,
+        Mxfp4ExpertDecodeGemvSpec,
+    },
     routed::RowTiledGemm,
 };
 use crate::{
@@ -37,6 +40,7 @@ pub struct MatmulMetalKernel {
     input_data_type: DataType,
     output_data_type: DataType,
     device_profile: DeviceProfile,
+    gemv_max_batch: u32,
 }
 
 enum MatmulDispatch {
@@ -46,6 +50,12 @@ enum MatmulDispatch {
 }
 
 impl MatmulMetalKernel {
+    /// Benchmark-only control for measuring the selector's GEMM arm against GEMV.
+    #[cfg(test)]
+    pub(crate) fn force_gemv_for_benchmark(&mut self) {
+        self.gemv_max_batch = u32::MAX;
+    }
+
     fn prefer_gemm_over_gemv(
         shape: MatmulShape,
         plan: GemmPlan,
@@ -103,6 +113,7 @@ impl MatmulMetalKernel {
             self.input_data_type,
             self.output_data_type,
             context.device_profile(),
+            self.gemv_max_batch,
         );
         let problem = GemmProblem::new(
             *shape,
@@ -160,6 +171,7 @@ impl MatmulKernel for MatmulMetalKernel {
             input_data_type,
             output_data_type,
             device_profile: context.device_profile(),
+            gemv_max_batch: DEFAULT_GEMV_MAX_BATCH,
         })
     }
 
@@ -173,7 +185,7 @@ impl MatmulKernel for MatmulMetalKernel {
             || self.input_data_type != DataType::BF16
             || self.output_data_type != DataType::BF16
             || shape.a_full_precision
-            || !shape.is_quant()
+            || !shape.is_integer_quantized()
             || !shape.signed_codes
             || !shape.b_transpose
             || shape.b_leading_dimension.is_some()
@@ -406,9 +418,6 @@ impl MatmulKernel for MatmulMetalKernel {
             .into());
         }
 
-        if arguments.routing.expert_routes().is_some() || shape.b_microfloat.is_some() {
-            return self.row_tiled_gemm.encode(arguments, encoder).map_err(MetalError::from);
-        }
         // TODO: remove after GatherGEMM is supported
         if arguments.routing.sparse_readout_rows().is_some() {
             return Err(MetalError::KernelDispatchFailed(
@@ -418,6 +427,9 @@ impl MatmulKernel for MatmulMetalKernel {
                 )
                 .into(),
             ));
+        }
+        if arguments.routing.expert_routes().is_some() || shape.b_microfloat.is_some() {
+            return self.row_tiled_gemm.encode(arguments, encoder).map_err(MetalError::from);
         }
         self.gemm.encode_plan(arguments, plan, encoder)
     }

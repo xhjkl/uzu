@@ -117,6 +117,7 @@ struct QuantizedRowState {
   // Row index: dense = local row, gather = absolute gather index.
   void load(
       thread Params& params,
+      thread const bool (&active_rows)[RESULTS_PER_SIMDGROUP],
       const device uint* gather_indices,
       bool gathered,
       uint batch_idx,
@@ -125,6 +126,9 @@ struct QuantizedRowState {
   ) const {
     METAL_PRAGMA_UNROLL
     for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+      if (!active_rows[row]) {
+        continue;
+      }
       const uint addr_row = gathered ? gather_indices[batch_idx * out_vec_size + out_row + row] : row;
       const U scale = scale_rows.value(addr_row);
       params.scale[row] = scale;
