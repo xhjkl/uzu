@@ -146,10 +146,23 @@ struct Microfloat<B: Backend> {
     metadata: MicrofloatMetadata,
 }
 
+/// Mutually exclusive runtime representations of one logical matrix or bank.
+enum WeightStorage<B: Backend> {
+    FullPrecision {
+        values: Allocation<B>,
+    },
+    Integer {
+        values: Allocation<B>,
+        quantized: Quantized<B>,
+    },
+    Microfloat {
+        values: Allocation<B>,
+        microfloat: Microfloat<B>,
+    },
+}
+
 pub struct WeightMatrix<B: Backend> {
-    values: Allocation<B>,
-    quantized: Option<Quantized<B>>,
-    microfloat: Option<Microfloat<B>>,
+    storage: WeightStorage<B>,
 }
 
 impl<B: Backend> WeightMatrix<B> {
@@ -231,13 +244,14 @@ impl<B: Backend> WeightMatrix<B> {
             // describing its runtime role as one outer scale per matrix.
             let outer_scales = tree.leaf("global_scale")?.validate(&outer_scale_shape, data_type)?.read_allocation()?;
             return Ok(Self {
-                values,
-                quantized: None,
-                microfloat: Some(Microfloat {
-                    scales,
-                    outer_scales,
-                    metadata,
-                }),
+                storage: WeightStorage::Microfloat {
+                    values,
+                    microfloat: Microfloat {
+                        scales,
+                        outer_scales,
+                        metadata,
+                    },
+                },
             });
         }
 
@@ -247,9 +261,9 @@ impl<B: Backend> WeightMatrix<B> {
                 .validate(&bank_shape(matrix_count, &[rows, columns], banked), data_type)?
                 .read_allocation()?;
             return Ok(Self {
-                values,
-                quantized: None,
-                microfloat: None,
+                storage: WeightStorage::FullPrecision {
+                    values,
+                },
             });
         };
 
@@ -287,66 +301,140 @@ impl<B: Backend> WeightMatrix<B> {
             QuantizationMethod::ScaleSymmetric => QuantizedCorrection::Symmetric,
         };
         Ok(Self {
-            values,
-            quantized: Some(Quantized {
-                scales,
-                correction,
-                info,
-                signed_codes: false,
-            }),
-            microfloat: None,
+            storage: WeightStorage::Integer {
+                values,
+                quantized: Quantized {
+                    scales,
+                    correction,
+                    info,
+                    signed_codes: false,
+                },
+            },
         })
     }
 
     pub fn values(&self) -> &Allocation<B> {
-        &self.values
+        match &self.storage {
+            WeightStorage::FullPrecision {
+                values,
+            }
+            | WeightStorage::Integer {
+                values,
+                ..
+            }
+            | WeightStorage::Microfloat {
+                values,
+                ..
+            } => values,
+        }
     }
 
     pub fn quantization(&self) -> Option<QuantizationInfo> {
-        self.quantized.as_ref().map(|quantized| quantized.info)
+        match &self.storage {
+            WeightStorage::Integer {
+                quantized,
+                ..
+            } => Some(quantized.info),
+            WeightStorage::FullPrecision {
+                ..
+            }
+            | WeightStorage::Microfloat {
+                ..
+            } => None,
+        }
     }
 
     pub fn scales(&self) -> Option<&Allocation<B>> {
-        self.microfloat
-            .as_ref()
-            .map(|microfloat| &microfloat.scales)
-            .or_else(|| self.quantized.as_ref().map(|quantized| &quantized.scales))
+        match &self.storage {
+            WeightStorage::Integer {
+                quantized,
+                ..
+            } => Some(&quantized.scales),
+            WeightStorage::Microfloat {
+                microfloat,
+                ..
+            } => Some(&microfloat.scales),
+            WeightStorage::FullPrecision {
+                ..
+            } => None,
+        }
     }
 
     pub fn zero_points(&self) -> Option<&Allocation<B>> {
-        match &self.quantized.as_ref()?.correction {
-            QuantizedCorrection::ZeroPoints(zero_points) => Some(zero_points),
-            QuantizedCorrection::Biases(_) | QuantizedCorrection::Symmetric => None,
+        match &self.storage {
+            WeightStorage::Integer {
+                quantized:
+                    Quantized {
+                        correction: QuantizedCorrection::ZeroPoints(zero_points),
+                        ..
+                    },
+                ..
+            } => Some(zero_points),
+            WeightStorage::FullPrecision {
+                ..
+            }
+            | WeightStorage::Integer {
+                ..
+            }
+            | WeightStorage::Microfloat {
+                ..
+            } => None,
         }
     }
 
     pub fn biases(&self) -> Option<&Allocation<B>> {
-        match &self.quantized.as_ref()?.correction {
-            QuantizedCorrection::Biases(biases) => Some(biases),
-            QuantizedCorrection::ZeroPoints(_) | QuantizedCorrection::Symmetric => None,
+        match &self.storage {
+            WeightStorage::Integer {
+                quantized:
+                    Quantized {
+                        correction: QuantizedCorrection::Biases(biases),
+                        ..
+                    },
+                ..
+            } => Some(biases),
+            WeightStorage::FullPrecision {
+                ..
+            }
+            | WeightStorage::Integer {
+                ..
+            }
+            | WeightStorage::Microfloat {
+                ..
+            } => None,
         }
     }
 
     pub fn matmul_b(&self) -> MatmulB<'_, B> {
-        if let Some(microfloat) = self.microfloat.as_ref() {
-            return MatmulB::Microfloat {
-                codes: &self.values,
-                scales: &microfloat.scales,
-                outer_scales: &microfloat.outer_scales,
-                metadata: microfloat.metadata,
-            };
-        }
-        let Some(quantized) = self.quantized.as_ref() else {
-            return MatmulB::FullPrecision {
-                b: &self.values,
-            };
+        let (values, quantized) = match &self.storage {
+            WeightStorage::FullPrecision {
+                values,
+            } => {
+                return MatmulB::FullPrecision {
+                    b: values,
+                };
+            },
+            WeightStorage::Microfloat {
+                values,
+                microfloat,
+            } => {
+                return MatmulB::Microfloat {
+                    codes: values,
+                    scales: &microfloat.scales,
+                    outer_scales: &microfloat.outer_scales,
+                    metadata: microfloat.metadata,
+                };
+            },
+            WeightStorage::Integer {
+                values,
+                quantized,
+            } => (values, quantized),
         };
         let mode = quantized.info.mode;
         let group_size = quantized.info.group_size;
         let signed_codes = quantized.signed_codes;
         match &quantized.correction {
             QuantizedCorrection::Biases(biases) => MatmulB::ScaleBiasDequant {
-                b: &self.values,
+                b: values,
                 scales: &quantized.scales,
                 biases,
                 mode,
@@ -354,7 +442,7 @@ impl<B: Backend> WeightMatrix<B> {
                 signed_codes,
             },
             QuantizedCorrection::ZeroPoints(zero_points) => MatmulB::ScaleZeroPointDequant {
-                b: &self.values,
+                b: values,
                 scales: &quantized.scales,
                 zero_points,
                 mode,
@@ -362,7 +450,7 @@ impl<B: Backend> WeightMatrix<B> {
                 signed_codes,
             },
             QuantizedCorrection::Symmetric => MatmulB::ScaleSymmetricDequant {
-                b: &self.values,
+                b: values,
                 scales: &quantized.scales,
                 mode,
                 group_size,
@@ -372,7 +460,11 @@ impl<B: Backend> WeightMatrix<B> {
     }
 
     pub fn make_codes_signed(&mut self) {
-        let Some(quantized) = self.quantized.as_mut() else {
+        let WeightStorage::Integer {
+            values,
+            quantized,
+        } = &mut self.storage
+        else {
             return;
         };
         if quantized.signed_codes {
@@ -382,7 +474,7 @@ impl<B: Backend> WeightMatrix<B> {
             return;
         };
         let broadcast_mask = u64::from(sign_flip_mask) * 0x0101_0101_0101_0101;
-        let (prefix, words, suffix) = bytemuck::pod_align_to_mut::<u8, u64>(self.values.as_slice_mut());
+        let (prefix, words, suffix) = bytemuck::pod_align_to_mut::<u8, u64>(values.as_slice_mut());
         words.iter_mut().for_each(|word| *word ^= broadcast_mask);
         prefix.iter_mut().chain(suffix.iter_mut()).for_each(|code| *code ^= sign_flip_mask);
         quantized.signed_codes = true;
