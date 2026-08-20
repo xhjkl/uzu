@@ -3,6 +3,7 @@ use crate::backends::metal::device_profile::{DeviceGeneration, DeviceProfile, De
 // Full-precision GEMV accumulates four K values per SIMD lane, so one full
 // vectorized K block is 4 * 32 lanes.
 pub(crate) const FP_K_BLOCK: u32 = 128;
+pub(crate) const DEFAULT_GEMV_MAX_BATCH: u32 = 8;
 pub(crate) const DEFAULT_RESULTS_PER_SIMDGROUP: u32 = 4;
 pub(crate) const DEFAULT_NUM_SIMDGROUPS: u32 = 8;
 

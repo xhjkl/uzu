@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::OnceLock,
-};
+use std::collections::{HashMap, hash_map::Entry};
 
 use super::policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK};
 use crate::{
@@ -18,16 +15,6 @@ use crate::{
     },
     data_type::DataType,
 };
-
-const DEFAULT_GEMV_MAX_BATCH: u32 = 8;
-static GEMV_MAX_BATCH: OnceLock<u32> = OnceLock::new();
-
-fn max_gemv_batch_threshold() -> u32 {
-    *GEMV_MAX_BATCH.get_or_init(|| {
-        // TODO: remove magic env var
-        std::env::var("UZU_GEMV_MAX_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_GEMV_MAX_BATCH)
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GemvSpecialization {
@@ -53,11 +40,12 @@ impl GemvSpecialization {
         input_data_type: DataType,
         output_data_type: DataType,
         device_profile: DeviceProfile,
+        max_batch: u32,
     ) -> Option<GemvSpecialization> {
         if !shape.b_transpose || !shape.a_full_precision {
             return None;
         }
-        let is_quant = shape.is_quant();
+        let is_quant = shape.is_integer_quantized();
         let microfloat = shape.b_microfloat.is_some();
         let bad_leading_dimension = if is_quant {
             shape.b_leading_dimension.is_some()
@@ -73,7 +61,9 @@ impl GemvSpecialization {
         if shape.d_transform.contains(GemmDTransform::RHT) && !shape.n.is_multiple_of(HADAMARD_TRANSFORM_BLOCK_SIZE) {
             return None;
         }
-        if !shape.expert_routed && shape.n < DEFAULT_RESULTS_PER_SIMDGROUP {
+        // Sparse MXFP4 has no gathered GEMM arm, including one-to-three-row readouts.
+        let sparse_microfloat_readout = shape.sparse_readout && microfloat;
+        if !shape.expert_routed && shape.n < DEFAULT_RESULTS_PER_SIMDGROUP && !sparse_microfloat_readout {
             return None;
         }
         // Integer expert banks have no grouped Metal arm yet. Preserve the
@@ -82,8 +72,7 @@ impl GemvSpecialization {
         let long_integer_expert_bank = shape.expert_routed && is_quant;
         // Sparse MXFP4 readout has no gathered GEMM arm. Keep it on the only
         // implementation that honors its physical B-row map at every M.
-        let sparse_microfloat_readout = shape.sparse_readout && microfloat;
-        if shape.m > max_gemv_batch_threshold() && !long_integer_expert_bank && !sparse_microfloat_readout {
+        if shape.m > max_batch && !long_integer_expert_bank && !sparse_microfloat_readout {
             return None;
         }
         if !is_quant {

@@ -50,6 +50,11 @@ struct QuantizedBSource {
 
     // Base row = out_row (dense) or 0 (gather); rows indexed relative to it.
     const uint base_row = matrix_idx * out_vec_size + (gathered ? 0u : out_row);
+    thread bool active_rows[RESULTS_PER_SIMDGROUP];
+    METAL_PRAGMA_UNROLL
+    for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+      active_rows[row] = out_row + row < out_vec_size;
+    }
 
     const device uint8_t* weights = reinterpret_cast<const device uint8_t*>(b);
     weights += base_row * weights_row_stride + simd_lane * packs_per_thread * bytes_per_pack;
@@ -64,9 +69,12 @@ struct QuantizedBSource {
       U input_sum = load_vector<AT, U, values_per_thread, BITS>(input, input_values, signed_codes);
 
       RowParams row_params;
-      row_state.load(row_params, gather_indices, gathered, assignment_idx, out_vec_size, out_row);
+      row_state.load(row_params, active_rows, gather_indices, gathered, assignment_idx, out_vec_size, out_row);
       METAL_PRAGMA_UNROLL
       for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+        if (!active_rows[row]) {
+          continue;
+        }
         const uint addr_row = gathered ? gather_indices[assignment_idx * out_vec_size + out_row + row] : row;
         const device uint8_t* weight_row = weights + addr_row * weights_row_stride;
         result[row] += qdot<U, values_per_thread, BITS>(
@@ -93,9 +101,12 @@ struct QuantizedBSource {
         U input_sum = load_vector_safe<AT, U, values_per_thread>(input, input_values, remaining);
 
         RowParams row_params;
-        row_state.load(row_params, gather_indices, gathered, assignment_idx, out_vec_size, out_row);
+        row_state.load(row_params, active_rows, gather_indices, gathered, assignment_idx, out_vec_size, out_row);
         METAL_PRAGMA_UNROLL
         for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+          if (!active_rows[row]) {
+            continue;
+          }
           const uint addr_row = gathered ? gather_indices[assignment_idx * out_vec_size + out_row + row] : row;
           const device uint8_t* weight_row = weights + addr_row * weights_row_stride;
           result[row] += qdot_safe<U, values_per_thread, BITS>(

@@ -7,7 +7,7 @@ use crate::{
     backends::{
         common::{
             Backend, Context, Encoder, Kernels,
-            gpu_types::QuantizationMode,
+            gpu_types::QuantizationMethod,
             kernel::matmul::{
                 ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
                 MatmulKernel, MatmulRouting,
@@ -19,6 +19,7 @@ use crate::{
     tests::{
         assert::{assert_eq_float, assert_eq_float_with_relative},
         helpers::{alloc_allocation, alloc_allocation_with_data, allocation_to_vec, for_each_non_cpu_backend},
+        matmul::{QuantBuffers, QuantInput, quant_b_variant},
     },
 };
 
@@ -47,43 +48,46 @@ fn run<B: Backend>(
     )
 }
 
-fn run_quantized_routes<B: Backend>() -> Vec<f32> {
+fn run_quantized_routes<B: Backend>(
+    n: u32,
+    k: u32,
+    bits: u32,
+    quant_method: QuantizationMethod,
+) -> Vec<f32> {
     const EXPERTS: usize = 3;
-    const ROUTES: usize = 33;
-    const N: usize = 8;
-    const K: usize = 32;
+    const ROUTES: usize = 2;
 
-    let input: Vec<bf16> = (0..ROUTES * K).map(|index| bf16::from_f32((index % 17) as f32 * 0.03 - 0.2)).collect();
-    let codes: Vec<u8> = (0..EXPERTS * N * K).map(|index| 124 + (index % 9) as u8).collect();
-    let scales: Vec<bf16> = (0..EXPERTS * N).map(|index| bf16::from_f32(0.01 + (index % 5) as f32 * 0.002)).collect();
-    let expert_ids: Vec<i32> = (0..ROUTES).map(|route| ((route * 5 + 1) % EXPERTS) as i32).collect();
+    let input = QuantInput::<bf16>::new(
+        ROUTES as u32,
+        k,
+        EXPERTS as u32 * n,
+        32,
+        bits,
+        quant_method,
+        u64::from(n * 100 + k + bits),
+    );
+    // The final bank member makes every inactive row an actual out-of-bounds read.
+    let expert_ids = [EXPERTS as i32 - 1; ROUTES];
 
     let context = B::Context::new().expect("create backend context");
-    let input = alloc_allocation_with_data::<B, bf16>(context.as_ref(), &input);
-    let codes = alloc_allocation_with_data::<B, u8>(context.as_ref(), &codes);
-    let scales = alloc_allocation_with_data::<B, bf16>(context.as_ref(), &scales);
+    let buffers = QuantBuffers::<B, bf16>::allocate(context.as_ref(), &input);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &expert_ids);
     let route_identity = ExpertRouteIdentity::new();
-    let mut output = alloc_allocation::<B, bf16>(context.as_ref(), ROUTES * N);
+    let mut output = alloc_allocation::<B, bf16>(context.as_ref(), ROUTES * n as usize);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::BF16, DataType::BF16, DataType::BF16)
             .expect("create matmul");
     let mut encoder = Encoder::<B>::new(context.as_ref()).expect("create encoder");
+    let b = quant_b_variant(&buffers.w, &buffers.scales, buffers.zp.as_ref(), buffers.bias.as_ref(), &input);
 
     kernel
         .encode(
             MatmulArguments::<B> {
                 a: MatmulA::FullPrecision {
-                    values: &input,
+                    values: &buffers.x,
                     offset: 0,
                 },
-                b: MatmulB::ScaleSymmetricDequant {
-                    b: &codes,
-                    scales: &scales,
-                    mode: QuantizationMode::U8,
-                    group_size: K as u32,
-                    signed_codes: false,
-                },
+                b,
                 b_leading_dimension: None,
                 b_transpose: true,
                 d: &mut output,
@@ -96,8 +100,8 @@ fn run_quantized_routes<B: Backend>() -> Vec<f32> {
                     input: ExpertInput::Routes,
                 }),
                 m: ROUTES as u32,
-                n: N as u32,
-                k: K as u32,
+                n,
+                k,
             },
             &mut encoder,
         )
@@ -745,9 +749,30 @@ fn grouped_prefill_routes_remain_route_major() {
 
 #[uzu_test]
 fn integer_quantized_weights_remain_independent_from_expert_routing() {
-    let expected = run_quantized_routes::<Cpu>();
-    for_each_non_cpu_backend!(|B| {
-        let actual = run_quantized_routes::<B>();
-        assert_eq_float(&expected, &actual, 1e-3, "quantized expert routes");
-    });
+    for bits in [4, 8] {
+        let aligned_k = if bits == 4 {
+            512
+        } else {
+            256
+        };
+        for k in [aligned_k, aligned_k + 16] {
+            for quant_method in
+                [QuantizationMethod::ScaleBias, QuantizationMethod::ScaleZeroPoint, QuantizationMethod::ScaleSymmetric]
+            {
+                for n in [1, 2, 3, 5, 6, 7] {
+                    let expected = run_quantized_routes::<Cpu>(n, k, bits, quant_method);
+                    for_each_non_cpu_backend!(|B| {
+                        let actual = run_quantized_routes::<B>(n, k, bits, quant_method);
+                        assert_eq_float_with_relative(
+                            &expected,
+                            &actual,
+                            0.5,
+                            0.05,
+                            "quantized final-expert output tail",
+                        );
+                    });
+                }
+            }
+        }
+    }
 }
