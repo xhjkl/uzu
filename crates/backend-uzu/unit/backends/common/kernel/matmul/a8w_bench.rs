@@ -17,7 +17,9 @@ use crate::{
                 matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting, MatmulShape},
             },
         },
-        metal::{DeviceProfile, GemmEngine, GemvDispatch, GemvSpecialization, Metal, MetalContext},
+        metal::{
+            DEFAULT_GEMV_MAX_BATCH, DeviceProfile, GemmEngine, GemvDispatch, GemvSpecialization, Metal, MetalContext,
+        },
     },
     data_type::DataType,
     tests::{
@@ -206,6 +208,7 @@ fn encode_step(
                 DataType::BF16,
                 DataType::BF16,
                 device_profile,
+                DEFAULT_GEMV_MAX_BATCH,
             )
             .expect("bf16 gemv specialization");
             gemv.encode(args, spec, encoder).expect("bf16 gemv encode");
@@ -250,6 +253,7 @@ fn bench_bits(
             DataType::BF16,
             DataType::BF16,
             device_profile,
+            DEFAULT_GEMV_MAX_BATCH,
         )
         .is_some();
 

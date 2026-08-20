@@ -268,6 +268,12 @@ fn parity_gemv_partial_group_bf16(
 
 #[rstest]
 #[test_attr(uzu_test)]
+#[case::n5_gs32_4bit_bias(1, 512, 5, 32, 4, QuantizationMethod::ScaleBias)]
+#[case::n6_gs32_4bit_zp_tail_k(1, 528, 6, 32, 4, QuantizationMethod::ScaleZeroPoint)]
+#[case::n7_gs32_4bit_sym(1, 512, 7, 32, 4, QuantizationMethod::ScaleSymmetric)]
+#[case::n5_gs32_8bit_bias(1, 256, 5, 32, 8, QuantizationMethod::ScaleBias)]
+#[case::n6_gs32_8bit_zp_tail_k(1, 272, 6, 32, 8, QuantizationMethod::ScaleZeroPoint)]
+#[case::n7_gs32_8bit_sym(1, 256, 7, 32, 8, QuantizationMethod::ScaleSymmetric)]
 #[case::n12_gs32_4bit(1, 256, 12, 32, 4, QuantizationMethod::ScaleBias)]
 #[case::n20_gs64_4bit_zp(2, 256, 20, 64, 4, QuantizationMethod::ScaleZeroPoint)]
 #[case::n36_gs32_8bit(1, 256, 36, 32, 8, QuantizationMethod::ScaleBias)]
