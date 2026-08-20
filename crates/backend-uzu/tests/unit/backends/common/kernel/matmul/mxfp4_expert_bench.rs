@@ -230,7 +230,7 @@ fn encode_mxfp4_moe(
             encoder,
         )
         .expect("whole-MoE W2");
-    finalize.encode(route_weights, route_outputs, output, token_count, model_dim, routes_per_token.get(), encoder);
+    finalize.encode(route_weights, &*route_outputs, output, token_count, model_dim, routes_per_token.get(), encoder);
 }
 
 #[uzu_test]
