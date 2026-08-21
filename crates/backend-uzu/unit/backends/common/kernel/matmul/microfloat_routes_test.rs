@@ -8,7 +8,8 @@ use crate::{
         common::{
             Backend, Context, Encoder, Kernels,
             kernel::matmul::{
-                ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting,
+                ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
+                MatmulKernel, MatmulRouting,
             },
             microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata, decode_mxfp4},
         },
@@ -119,6 +120,7 @@ fn run<B: Backend>(
     let outer_scales_alloc = alloc_allocation_with_data::<B, f32>(context.as_ref(), &outer_scales);
     let biases_alloc = alloc_allocation_with_data::<B, f32>(context.as_ref(), &biases);
     let ids_alloc = alloc_allocation_with_data::<B, i32>(context.as_ref(), &expert_ids);
+    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), route_count * N);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -145,6 +147,7 @@ fn run<B: Backend>(
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
+                    identity: &route_identity,
                     expert_ids: &ids_alloc,
                     routes_per_token: NonZeroU32::new(routes_per_token).unwrap(),
                     expert_count: NonZeroU32::new(EXPERTS as u32).unwrap(),
@@ -282,9 +285,8 @@ fn run_sparse_readout<B: Backend>(group_size: u32) -> (Vec<f32>, Vec<f32>) {
             low | (high << 4)
         })
         .collect();
-    let scales: Vec<u8> = (0..VOCAB_ROWS * K / group_size as usize)
-        .map(|index| 124 + ((index * 3 + 1) % 5) as u8)
-        .collect();
+    let scales: Vec<u8> =
+        (0..VOCAB_ROWS * K / group_size as usize).map(|index| 124 + ((index * 3 + 1) % 5) as u8).collect();
     let outer_scales = [1.25f32];
     let readout_rows: Vec<u32> = (0..INPUT_ROWS)
         .flat_map(|row| {
@@ -398,6 +400,7 @@ fn run_tiny_output<B: Backend>(
     let outer_scales = alloc_allocation_with_data::<B, f32>(context.as_ref(), &outer_scales);
     let biases = alloc_allocation_with_data::<B, f32>(context.as_ref(), &biases);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &expert_ids);
+    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), EXPERTS * n);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -424,6 +427,7 @@ fn run_tiny_output<B: Backend>(
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
+                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(EXPERTS as u32).unwrap(),
@@ -476,6 +480,7 @@ fn run_external_fixture<B: Backend>() -> Vec<f32> {
     let outer_scales = alloc_allocation_with_data::<B, f32>(context.as_ref(), &[0.5]);
     let biases = alloc_allocation_with_data::<B, f32>(context.as_ref(), &biases);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &[0]);
+    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), FIXTURE_N);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -503,6 +508,7 @@ fn run_external_fixture<B: Backend>() -> Vec<f32> {
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
+                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(1).unwrap(),
@@ -570,6 +576,7 @@ fn rejection<B: Backend>(
     let scales = alloc_allocation_with_data::<B, u8>(context.as_ref(), &vec![127; metadata.required_scale_bytes()]);
     let outer_scales = alloc_allocation_with_data::<B, f32>(context.as_ref(), &vec![1.0; matrix_count as usize]);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &[0]);
+    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), N);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -593,6 +600,7 @@ fn rejection<B: Backend>(
                 d: &mut output,
                 d_transform: MatmulDOps::none(),
                 routing: MatmulRouting::Experts(ExpertRoutes {
+                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(expert_count).unwrap(),
