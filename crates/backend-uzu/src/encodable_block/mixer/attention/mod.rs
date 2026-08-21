@@ -44,6 +44,7 @@ pub struct Attention<B: Backend> {
     projection_dim: u32,
     projection: LinearProjection<B>,
     prepare: <B::Kernels as Kernels>::AttentionPrepareKernel,
+    gate_projection: Option<Box<dyn Linear<B>>>,
     sinks: Option<Allocation<B>>,
     flat_core: AttentionCores<B>,
     trie_core: AttentionCores<B>,
@@ -85,26 +86,63 @@ impl<B: Backend> Attention<B> {
 
         let q_dim = num_q_heads * head_dim;
 
-        let projection_tree = parameter_tree.subtree("qkvg_projection");
+        // Fused artifacts append the gate to `qkvg_projection`; legacy artifacts
+        // keep `qkv_projection` and an optional separate `gate_projection`.
+        let fused_projection = parameter_tree.has_subtree("qkvg_projection");
+        let has_gate = config.has_gate || config.gate_projection_config.is_some();
+
+        let projection_tree = parameter_tree.subtree(if fused_projection {
+            "qkvg_projection"
+        } else {
+            "qkv_projection"
+        });
         let qkv_dim = if let Some(num_kv_heads) = num_kv_heads {
             let kv_dim = num_kv_heads * head_dim;
             q_dim + kv_dim + kv_dim
         } else {
             q_dim
         };
-        let projection_dim = if config.has_gate {
+        let projection_dim = if fused_projection && has_gate {
             qkv_dim + q_dim
         } else {
             qkv_dim
         };
-        let (projection, in_projection_input_hadamard_factors) = <dyn Linear<B>>::new_with_input_rht(
-            hidden_dim,
-            [projection_dim],
-            config.has_qkvg_biases,
-            context,
-            data_type,
-            &projection_tree,
-        )?;
+        let (projection, in_projection_input_hadamard_factors) = if fused_projection || !has_gate {
+            <dyn Linear<B>>::new_with_input_rht(
+                hidden_dim,
+                [projection_dim],
+                config.has_qkvg_biases,
+                context,
+                data_type,
+                &projection_tree,
+            )?
+        } else {
+            // A legacy separate gate consumes the same input as the packed
+            // projection, so the input RHT cannot be hoisted and shared.
+            (
+                <dyn Linear<B>>::new(
+                    hidden_dim,
+                    [projection_dim],
+                    config.has_qkvg_biases,
+                    context,
+                    data_type,
+                    &projection_tree,
+                )?,
+                None,
+            )
+        };
+        let gate_projection = (!fused_projection && has_gate)
+            .then(|| {
+                <dyn Linear<B>>::new(
+                    hidden_dim,
+                    [q_dim],
+                    false,
+                    context,
+                    data_type,
+                    &parameter_tree.subtree("gate_projection"),
+                )
+            })
+            .transpose()?;
 
         let query_norm_config = config.query_norm_config.clone();
         // TODO: Fix lalamo config, those two must be None if kv sharing.
@@ -176,8 +214,7 @@ impl<B: Backend> Attention<B> {
         )
         .map_err(AttentionNewError::Backend)?;
 
-        let gate_kernel = config
-            .has_gate
+        let gate_kernel = has_gate
             .then(|| <B::Kernels as Kernels>::SigmoidGateKernel::new(context, data_type))
             .transpose()
             .map_err(AttentionNewError::Backend)?;
@@ -206,6 +243,7 @@ impl<B: Backend> Attention<B> {
                     norm: qkv_norm,
                 },
                 prepare,
+                gate_projection,
                 sinks,
                 flat_core,
                 trie_core,

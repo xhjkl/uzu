@@ -50,6 +50,16 @@ impl<B: Backend> Attention<B> {
         state: Option<MaybeMut<AttentionState<B>>>,
         encoder: &mut Encoder<B>,
     ) -> Result<Allocation<B>, B::Error> {
+        // A legacy separate gate shares the projection input, which the
+        // projection may transform in place; run the gate first, from a copy.
+        let (hidden, legacy_gate) = if let Some(gate_projection) = &self.gate_projection {
+            let mut hidden_copy = encoder.allocate_scratch(hidden.size())?;
+            encoder.encode_copy(&hidden, .., &mut hidden_copy, ..);
+            let gate = gate_projection.encode(hidden, batch_dim.size(), encoder)?;
+            (hidden_copy, Some(gate))
+        } else {
+            (hidden, None)
+        };
         let qkvg = self.projection.project(hidden, batch_dim.size(), encoder)?;
 
         let mut attention_output = match state {
@@ -123,15 +133,29 @@ impl<B: Backend> Attention<B> {
 
         if let Some(gate_kernel) = &self.gate_kernel {
             let gate_dim = self.num_q_heads * self.head_dim;
-            let gate_offset = self.projection_dim - gate_dim;
-            gate_kernel.encode(
-                (&qkvg, gate_offset as usize * self.data_type.size_in_bytes()),
-                &mut attention_output,
-                gate_dim,
-                batch_dim.size(),
-                self.projection_dim,
-                encoder,
-            );
+            match legacy_gate {
+                Some(gate) => {
+                    gate_kernel.encode(
+                        (&gate, 0),
+                        &mut attention_output,
+                        gate_dim,
+                        batch_dim.size(),
+                        gate_dim,
+                        encoder,
+                    );
+                },
+                None => {
+                    let gate_offset = self.projection_dim - gate_dim;
+                    gate_kernel.encode(
+                        (&qkvg, gate_offset as usize * self.data_type.size_in_bytes()),
+                        &mut attention_output,
+                        gate_dim,
+                        batch_dim.size(),
+                        self.projection_dim,
+                        encoder,
+                    );
+                },
+            }
         }
         self.out_projection.encode(attention_output, batch_dim.size(), encoder)
     }
