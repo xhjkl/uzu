@@ -14,8 +14,8 @@ use crate::{
             kernel::{
                 FullPrecisionEmbeddingLookupKernel,
                 matmul::{
-                    ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel,
-                    MatmulRouting,
+                    ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
+                    MatmulKernel, MatmulRouting,
                 },
             },
             microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
@@ -59,6 +59,7 @@ fn bench_shape(
     let route_token_ids = alloc_allocation_with_data::<Metal, u32>(context, &route_token_ids);
     let expert_ids: Vec<i32> = (0..route_count).map(|route| (route % expert_count) as i32).collect();
     let expert_ids = alloc_allocation_with_data::<Metal, i32>(context, &expert_ids);
+    let route_identity = ExpertRouteIdentity::new();
     let mut expanded_input = alloc_allocation::<Metal, bf16>(context, route_count as usize * k as usize);
     let mut output = alloc_allocation::<Metal, bf16>(context, route_count as usize * n as usize);
     let mut matmul =
@@ -102,6 +103,7 @@ fn bench_shape(
                         d: &mut output,
                         d_transform: MatmulDOps::none(),
                         routing: MatmulRouting::Experts(ExpertRoutes {
+                            identity: &route_identity,
                             expert_ids: &expert_ids,
                             routes_per_token,
                             expert_count,
@@ -143,6 +145,7 @@ fn bench_shape(
                         d: &mut output,
                         d_transform: MatmulDOps::none(),
                         routing: MatmulRouting::Experts(ExpertRoutes {
+                            identity: &route_identity,
                             expert_ids: &expert_ids,
                             routes_per_token,
                             expert_count,
