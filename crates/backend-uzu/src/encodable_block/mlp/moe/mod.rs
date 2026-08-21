@@ -63,9 +63,9 @@ pub enum MoeBlockError<B: Backend> {
     ParameterLoaderError(#[from] ParameterLoaderError<B>),
     #[error("MoE requires model_dim % 4 == 0")]
     InvalidModelDim,
-    #[error("MoE num_routed_experts must be <= 512")]
+    #[error("MoE num_routed_experts must be > 0 and <= 512")]
     InvalidRoutedExpertCount,
-    #[error("MoE num_active_routed_experts must be > 0 and <= 128")]
+    #[error("MoE num_active_routed_experts must be > 0, <= 128, and <= num_routed_experts")]
     InvalidActiveExpertCount,
     #[error("MoE shared experts are not supported")]
     UnsupportedSharedExperts,
@@ -79,6 +79,20 @@ pub enum MoeBlockError<B: Backend> {
     UnsupportedExpertActivation(ActivationType),
 }
 
+pub(crate) fn validate_expert_counts<B: Backend>(
+    routed_experts: u32,
+    active_experts: u32,
+) -> Result<(), MoeBlockError<B>> {
+    if routed_experts == 0 || routed_experts > 512 {
+        return Err(MoeBlockError::InvalidRoutedExpertCount);
+    }
+    if active_experts == 0 || active_experts > 128 || active_experts > routed_experts {
+        return Err(MoeBlockError::InvalidActiveExpertCount);
+    }
+
+    Ok(())
+}
+
 impl<B: Backend> MoeBlock<B> {
     pub fn new(
         context: &B::Context,
@@ -90,12 +104,7 @@ impl<B: Backend> MoeBlock<B> {
         if !model_dim.is_multiple_of(4) {
             return Err(MoeBlockError::InvalidModelDim);
         }
-        if moe_config.num_active_routed_experts == 0 || moe_config.num_active_routed_experts > 128 {
-            return Err(MoeBlockError::InvalidActiveExpertCount);
-        }
-        if moe_config.num_routed_experts > 512 {
-            return Err(MoeBlockError::InvalidRoutedExpertCount);
-        }
+        validate_expert_counts::<B>(moe_config.num_routed_experts, moe_config.num_active_routed_experts)?;
         if moe_config.num_shared_experts != 0 {
             return Err(MoeBlockError::UnsupportedSharedExperts);
         }
