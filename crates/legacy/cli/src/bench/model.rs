@@ -1,4 +1,4 @@
-use backend_uzu::data_type::DataType;
+use backend_uzu::{backends::common::Int8Execution, data_type::DataType};
 use rocket::serde::{Deserialize, Serialize};
 use uzu::types::session::chat::{ChatMessage, ChatReplyPowerStats, ChatRole};
 
@@ -58,6 +58,8 @@ pub struct BenchResult {
     pub engine_version: String,
     pub timestamp: u64,
     pub data_type: DataType,
+    #[serde(default)]
+    pub int8_execution: Option<Int8Execution>,
     pub memory_used: Option<usize>,
     pub tokens_count_input: u64,
     pub tokens_count_output: u64,

@@ -255,7 +255,7 @@ impl<B: Backend> WeightMatrix<B> {
             });
         }
 
-        let Some(info) = quantization else {
+        let Some(mut info) = quantization else {
             let values = tree
                 .leaf("weights")?
                 .validate(&bank_shape(matrix_count, &[rows, columns], banked), data_type)?
@@ -267,6 +267,10 @@ impl<B: Backend> WeightMatrix<B> {
             });
         };
 
+        let weights = tree.leaf("weights")?;
+        if info.mode == QuantizationMode::U8 && weights.data_type() == DataType::I8 {
+            info.mode = QuantizationMode::I8;
+        }
         let group_size = info.group_size;
         let packing_divisor = info.mode.packing_divisor();
         let storage_data_type = info.mode.storage_type();
@@ -276,8 +280,7 @@ impl<B: Backend> WeightMatrix<B> {
             )));
         }
         let groups = columns.div_ceil(group_size);
-        let values = tree
-            .leaf("weights")?
+        let values = weights
             .validate(&bank_shape(matrix_count, &[rows, columns / packing_divisor], banked), storage_data_type)?
             .read_allocation()?;
         let scales = tree
@@ -307,7 +310,7 @@ impl<B: Backend> WeightMatrix<B> {
                     scales,
                     correction,
                     info,
-                    signed_codes: false,
+                    signed_codes: info.mode == QuantizationMode::I8,
                 },
             },
         })
@@ -597,3 +600,7 @@ mod tests {
         tree.assert_all_tensors_validated().expect("validate dense MXFP4 tensors");
     }
 }
+
+#[cfg(test)]
+#[path = "../../unit/encodable_block/weight_matrix_int8_test.rs"]
+mod int8_tests;

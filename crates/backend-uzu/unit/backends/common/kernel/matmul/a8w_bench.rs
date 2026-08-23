@@ -226,7 +226,8 @@ fn bench_bits(
 ) {
     let mut matmul = <MetalMatmul as MatmulKernel>::new(context, DataType::BF16, DataType::BF16, DataType::BF16)
         .expect("matmul kernel");
-    let mut gemv = GemvDispatch::new(DataType::BF16, DataType::BF16, DataType::BF16);
+    let mut gemv =
+        GemvDispatch::new(context, DataType::BF16, DataType::BF16, DataType::BF16).expect("bf16 gemv dispatch");
 
     let mut group = c.benchmark_group(format!("{}/Kernel/A8W/w{bits}", type_short_name::<Metal>()));
     group.sample_size(10);

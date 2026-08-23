@@ -24,4 +24,8 @@ pub use device_profile::{DeviceGeneration, DeviceProfile, DeviceSize};
 #[cfg(test)]
 pub use kernel::matmul::gemm::GemmEngine;
 #[cfg(test)]
-pub(crate) use kernel::matmul::gemv::{DEFAULT_GEMV_MAX_BATCH, GemvDispatch, GemvSpecialization};
+pub(crate) use kernel::matmul::gemv::{
+    DEFAULT_GEMV_MAX_BATCH, GemvDispatch, GemvSpecialization, ResidentInt8ExpertTensorOpsDispatch,
+};
+
+pub use crate::backends::common::Int8Execution;

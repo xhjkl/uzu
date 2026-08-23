@@ -7,6 +7,7 @@ mod device_capabilities;
 mod encoder;
 pub mod gpu_types;
 mod hazard_tracker;
+mod int8_execution;
 pub mod kernel;
 pub mod microfloat;
 
@@ -27,4 +28,5 @@ pub use context::Context;
 pub use device_capabilities::DeviceCapabilities;
 pub use encoder::{Completed, Encoder, Executable, Pending};
 pub use hazard_tracker::Access;
+pub use int8_execution::Int8Execution;
 pub use kernel::Kernels;

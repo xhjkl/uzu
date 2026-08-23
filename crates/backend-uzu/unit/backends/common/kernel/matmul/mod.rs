@@ -6,6 +6,7 @@ mod gemm_bench;
 mod gemv_test;
 mod microfloat_routes_test;
 mod mxfp4_expert_bench;
+mod mxfp4_int8_tensorops_test;
 mod quant_dispatch_test;
 mod quant_gemm_bench;
 mod quant_gemv_bench;

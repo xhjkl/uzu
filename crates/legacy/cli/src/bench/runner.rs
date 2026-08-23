@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use backend_uzu::{VERSION, data_type::DataType};
+use backend_uzu::{VERSION, bridge::resolve_int8_execution, data_type::DataType};
 use shoji::types::model::{ModelFamily, ModelReference};
 use sysinfo::System;
 use uzu::{
@@ -44,6 +44,7 @@ impl BenchRunner {
         let model_path_string = self.model_path.trim_end_matches('/').to_string();
         let model_path = PathBuf::from(&model_path_string);
         let parent_path = model_path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let int8_execution = resolve_int8_execution(&model_path)?;
         let engine_config = EngineConfig::default().with_local_path(parent_path);
         let engine = Engine::new(engine_config).await.with_context(|| "Can not create engine".to_string())?;
 
@@ -125,6 +126,7 @@ impl BenchRunner {
                 engine_version: VERSION.to_string(),
                 timestamp,
                 data_type: DataType::BF16,
+                int8_execution,
                 memory_used: session.peak_memory_usage().await,
                 tokens_count_input,
                 tokens_count_output,

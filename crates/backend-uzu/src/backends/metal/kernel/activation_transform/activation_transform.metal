@@ -12,7 +12,9 @@ using namespace uzu::activation_transform;
 #define NUM_SIMDGROUPS 4
 #define NUM_THREADS NUM_SIMDGROUPS* METAL_SIMD_SIZE
 
-#define QUANTIZED (ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums)
+#define PLAIN (ops == ActivationTransformOp::QuantizeSymmetricPlain)
+#define QUANTIZED \
+  (ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums || PLAIN)
 #define EMITS_GROUP_SUMS (ops == ActivationTransformOp::QuantizeWithGroupSums)
 
 template <typename T>
@@ -23,7 +25,7 @@ PUBLIC KERNEL(ActivationTransform)(
     device int8_t* q_out OPTIONAL(QUANTIZED),
     device float* scales_out OPTIONAL(QUANTIZED),
     device int32_t* group_sums_out OPTIONAL(EMITS_GROUP_SUMS),
-    const device int32_t* rht_factors,
+    const device int32_t* rht_factors OPTIONAL(!PLAIN),
     constant uint& batch_size,
     constant uint& element_count,
     const ActivationTransformOp ops SPECIALIZE,
@@ -47,15 +49,17 @@ PUBLIC KERNEL(ActivationTransform)(
   const ushort simdgroup_index = thread_context.simdgroup_index;
   const uint tile_offset = activation_tile_index * ACTIVATION_QUANT_TILE_SIZE;
   const uint simdgroup_offset = tile_offset + simdgroup_index * METAL_SIMD_SIZE;
-  const bool in_bounds = simdgroup_offset < element_count;
   const uint factor_index = simdgroup_offset + lane_index;
+  const bool in_bounds = factor_index < element_count;
   const uint element_index = batch_index * element_count + factor_index;
 
   float value = 0.0f;
   if (in_bounds) {
     value = static_cast<float>(input[element_index]);
-    value = input_rht ? simdgroup_input_random_hadamard_transform(lane_index, value, rht_factors[factor_index])
-                      : simdgroup_output_random_hadamard_transform(lane_index, value, rht_factors[factor_index]);
+    if (!PLAIN) {
+      value = input_rht ? simdgroup_input_random_hadamard_transform(lane_index, value, rht_factors[factor_index])
+                        : simdgroup_output_random_hadamard_transform(lane_index, value, rht_factors[factor_index]);
+    }
   }
 
   if (!QUANTIZED) {
@@ -66,7 +70,7 @@ PUBLIC KERNEL(ActivationTransform)(
   }
 
   const float maximum = reduce_activation_quantization_group(
-      fabs(value),
+      isfinite(value) ? fabs(value) : 0.0f,
       activation_scale_group_size,
       partial_max,
       thread_context,
@@ -75,8 +79,9 @@ PUBLIC KERNEL(ActivationTransform)(
   );
   const float scale = isfinite(maximum) && maximum > 0.0f ? maximum / ACTIVATION_QUANT_INT8_MAX : 1.0f;
 
-  const int8_t code =
-      static_cast<int8_t>(clamp(round(value / scale), -ACTIVATION_QUANT_INT8_MAX, ACTIVATION_QUANT_INT8_MAX));
+  const int8_t code = isfinite(value)
+      ? static_cast<int8_t>(clamp(round(value / scale), -ACTIVATION_QUANT_INT8_MAX, ACTIVATION_QUANT_INT8_MAX))
+      : static_cast<int8_t>(0);
   if (in_bounds) {
     q_out[element_index] = code;
   }
