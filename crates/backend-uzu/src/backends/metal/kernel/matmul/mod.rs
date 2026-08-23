@@ -97,6 +97,7 @@ impl MatmulMetalKernel {
             gate_act,
             context.device_profile(),
             self.gemv_max_batch,
+            context.int8_execution(),
         );
         let problem = GemmProblem::new(
             *shape,
@@ -140,7 +141,7 @@ impl MatmulKernel for MatmulMetalKernel {
         }
 
         let gemm = GemmKernel::new(context, weights_data_type, input_data_type, output_data_type)?;
-        let gemv = GemvDispatch::new(weights_data_type, input_data_type, output_data_type);
+        let gemv = GemvDispatch::new(context, weights_data_type, input_data_type, output_data_type)?;
 
         Ok(Self {
             gemv,

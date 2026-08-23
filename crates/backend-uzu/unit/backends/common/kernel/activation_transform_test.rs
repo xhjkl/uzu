@@ -105,10 +105,13 @@ fn input_and_output_rht_bf16() {
 
 mod quantize {
     use backend_uzu_macros::uzu_test;
+    use half::bf16;
+    use num_traits::Float;
     use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::BLOCK_SIZE;
     use crate::{
+        array::ArrayElement,
         backends::{
             common::{Backend, Context, Encoder, kernel::ActivationTransform},
             cpu::Cpu,
@@ -152,6 +155,41 @@ mod quantize {
         encoder.end_encoding().submit().wait_until_completed().unwrap();
 
         (allocation_to_vec(&values), allocation_to_vec(&scales), group_sums.as_ref().map(allocation_to_vec))
+    }
+
+    fn run_plain<T: ArrayElement + Float, B: Backend>(
+        input_data: &[T],
+        rows: u32,
+        columns: u32,
+        group_size: u32,
+    ) -> (Vec<i8>, Vec<f32>) {
+        let context = B::Context::new().expect("context");
+        let input = alloc_allocation_with_data::<B, T>(context.as_ref(), input_data);
+        let mut values = alloc_allocation::<B, i8>(context.as_ref(), input_data.len());
+        let mut scales = alloc_allocation::<B, f32>(context.as_ref(), (rows * columns / group_size) as usize);
+        let kernel = ActivationTransform::quantize_symmetric_plain(context.as_ref(), T::data_type(), group_size)
+            .expect("plain symmetric quantizer");
+        let mut encoder = Encoder::<B>::new(context.as_ref()).expect("encoder");
+        kernel.encode_quantize_symmetric_plain(&input, &mut values, &mut scales, rows, columns, &mut encoder);
+        encoder.end_encoding().submit().wait_until_completed().unwrap();
+        (allocation_to_vec(&values), allocation_to_vec(&scales))
+    }
+
+    fn check_plain<T: ArrayElement + Float, B: Backend>(
+        input_data: &[T],
+        rows: u32,
+        columns: u32,
+        group_size: u32,
+    ) {
+        let (actual_values, actual_scales) = run_plain::<T, B>(input_data, rows, columns, group_size);
+        let (expected_values, expected_scales) = run_plain::<T, Cpu>(input_data, rows, columns, group_size);
+        for (index, (&actual, &expected)) in actual_scales.iter().zip(&expected_scales).enumerate() {
+            let relative_error = (actual - expected).abs() / expected.abs().max(1e-6);
+            assert!(relative_error < 1e-6, "scale {index}: {actual} != {expected}");
+        }
+        for (index, (&actual, &expected)) in actual_values.iter().zip(&expected_values).enumerate() {
+            assert!((i32::from(actual) - i32::from(expected)).abs() <= 1, "code {index}: {actual} != {expected}");
+        }
     }
 
     fn check_quantize(
@@ -241,5 +279,31 @@ mod quantize {
     fn quantize_scale_g32_and_g64_match_cpu() {
         check_quantize(32, false, None);
         check_quantize(64, false, None);
+    }
+
+    #[uzu_test]
+    fn plain_symmetric_group32_matches_cpu() {
+        let rows = 3;
+        let columns = 2880;
+        let input_f32: Vec<f32> = (0..rows * columns).map(|index| ((index as f32) * 0.03125).sin() * 7.0).collect();
+        let input_bf16: Vec<bf16> = input_f32.iter().copied().map(bf16::from_f32).collect();
+
+        for_each_backend!(|B| {
+            check_plain::<f32, B>(&input_f32, rows, columns, 32);
+            check_plain::<bf16, B>(&input_bf16, rows, columns, 32);
+        });
+    }
+
+    #[uzu_test]
+    fn plain_symmetric_rounding_and_nonfinite_policy_match_cpu() {
+        let mut input = vec![0.0f32; 64];
+        input[..8].copy_from_slice(&[127.0, 0.5, -0.5, 1.5, -1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        let (expected_values, expected_scales) = run_plain::<f32, Cpu>(&input, 1, 64, 32);
+        assert_eq!(&expected_values[..8], &[127, 1, -1, 2, -2, 0, 0, 0]);
+        assert_eq!(expected_scales, vec![1.0, 1.0]);
+
+        for_each_backend!(|B| {
+            assert_eq!(run_plain::<f32, B>(&input, 1, 64, 32), (expected_values.clone(), expected_scales.clone()));
+        });
     }
 }

@@ -87,6 +87,16 @@ impl<B: Backend> ActivationTransform<B> {
         Self::new(context, data_type, ops, false, activation_group_size, sum_group_size)
     }
 
+    /// Symmetric K32 quantization without the normal randomized Hadamard transform.
+    pub fn quantize_symmetric_plain(
+        context: &B::Context,
+        data_type: DataType,
+        activation_group_size: u32,
+    ) -> Result<Self, B::Error> {
+        assert_eq!(activation_group_size, 32, "plain symmetric activation groups must match the TensorOps K tile");
+        Self::new(context, data_type, ActivationTransformOp::QuantizeSymmetricPlain, false, activation_group_size, None)
+    }
+
     /// `input` and `output` must be distinct buffers.
     pub fn encode_fp(
         &self,
@@ -105,7 +115,7 @@ impl<B: Backend> ActivationTransform<B> {
             None::<&mut Allocation<B>>,
             None::<&mut Allocation<B>>,
             None::<&mut Allocation<B>>,
-            rht_factors,
+            Some(rht_factors),
             batch_size,
             element_count,
             encoder,
@@ -128,7 +138,7 @@ impl<B: Backend> ActivationTransform<B> {
             None::<&mut Allocation<B>>,
             None::<&mut Allocation<B>>,
             None::<&mut Allocation<B>>,
-            rht_factors,
+            Some(rht_factors),
             batch_size,
             element_count,
             encoder,
@@ -162,7 +172,36 @@ impl<B: Backend> ActivationTransform<B> {
             Some(q_out),
             Some(scales_out),
             group_sums_out,
-            rht_factors,
+            Some(rht_factors),
+            batch_size,
+            element_count,
+            encoder,
+        );
+    }
+
+    /// Encode the plain K32 representation consumed by the resident INT8 path.
+    pub fn encode_quantize_symmetric_plain(
+        &self,
+        input: &Allocation<B>,
+        q_out: &mut Allocation<B>,
+        scales_out: &mut Allocation<B>,
+        batch_size: u32,
+        element_count: u32,
+        encoder: &mut Encoder<B>,
+    ) {
+        assert_eq!(self.ops, ActivationTransformOp::QuantizeSymmetricPlain);
+        assert!(
+            element_count.is_multiple_of(self.activation_group_size),
+            "quantized activation row ({element_count}) must be a multiple of scale group ({})",
+            self.activation_group_size
+        );
+        self.kernel.encode(
+            Some(input),
+            None::<&mut Allocation<B>>,
+            Some(q_out),
+            Some(scales_out),
+            None::<&mut Allocation<B>>,
+            None::<&Allocation<B>>,
             batch_size,
             element_count,
             encoder,
@@ -170,7 +209,12 @@ impl<B: Backend> ActivationTransform<B> {
     }
 
     fn quantizes(&self) -> bool {
-        matches!(self.ops, ActivationTransformOp::Quantize | ActivationTransformOp::QuantizeWithGroupSums)
+        matches!(
+            self.ops,
+            ActivationTransformOp::Quantize
+                | ActivationTransformOp::QuantizeWithGroupSums
+                | ActivationTransformOp::QuantizeSymmetricPlain
+        )
     }
 
     pub fn emit_group_sums(&self) -> bool {

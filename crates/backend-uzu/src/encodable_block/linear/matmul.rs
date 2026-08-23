@@ -151,7 +151,7 @@ impl<B: Backend> LinearMatmul<B> {
             }
         }
 
-        let matrix = match matrix_count {
+        let mut matrix = match matrix_count {
             Some(matrix_count) => WeightMatrix::load_bank(
                 weights_tree,
                 spec,
@@ -165,6 +165,9 @@ impl<B: Backend> LinearMatmul<B> {
                 WeightMatrix::load(weights_tree, spec, Layout::OutputInput, output_dim, input_dim, weights_data_type)?
             },
         };
+        if matrix_count.is_some() {
+            matrix.prepare_mxfp4_int8(context)?;
+        }
         if output_hadamard_factors.is_some() && matrix.quantization().is_none() {
             return Err(LinearMatmulError::UnsupportedConfiguration(
                 "fused output-hadamard factors require quantized weights".into(),

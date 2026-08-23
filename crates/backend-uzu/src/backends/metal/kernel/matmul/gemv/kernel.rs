@@ -3,20 +3,22 @@ use std::collections::{HashMap, hash_map::Entry};
 use super::{
     mxfp4_expert_decode::{Mxfp4ExpertDecodeGemvDispatch, Mxfp4ExpertDecodeGemvSpec},
     policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK},
+    resident_int8_expert_tensorops::ResidentInt8ExpertTensorOpsDispatch,
 };
 use crate::{
     backends::{
         common::{
             Allocation, BufferArg, Encoder,
             gpu_types::{
-                HADAMARD_TRANSFORM_BLOCK_SIZE,
+                HADAMARD_TRANSFORM_BLOCK_SIZE, QuantizationMode,
                 gemm::{GemmBPrologueKind, GemmDTransform},
             },
-            kernel::matmul::{
-                ExpertInput, GateActMulDOps, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape,
+            kernel::{
+                ActivationTransform,
+                matmul::{ExpertInput, GateActMulDOps, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
             },
         },
-        metal::{Metal, context::MetalContext, device_profile::DeviceProfile, kernel::GemvMetalKernel},
+        metal::{Int8Execution, Metal, context::MetalContext, device_profile::DeviceProfile, kernel::GemvMetalKernel},
     },
     data_type::DataType,
 };
@@ -140,12 +142,15 @@ pub(crate) struct GemvDispatch {
     output_data_type: DataType,
     pipelines: HashMap<GemvSpecialization, GemvMetalKernel>,
     mxfp4_expert_decode: Mxfp4ExpertDecodeGemvDispatch,
+    resident_int8: ResidentInt8ExpertTensorOpsDispatch,
+    resident_int8_quantizer: ActivationTransform<Metal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GemvPlan {
     Generic(GemvSpecialization),
     Mxfp4ExpertDecode(Mxfp4ExpertDecodeGemvSpec),
+    ResidentInt8(Int8Execution),
 }
 
 impl From<GemvSpecialization> for GemvPlan {
@@ -156,11 +161,14 @@ impl From<GemvSpecialization> for GemvPlan {
 
 impl GemvDispatch {
     pub(crate) fn new(
+        context: &MetalContext,
         weights_data_type: DataType,
         input_data_type: DataType,
         output_data_type: DataType,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, MatmulError<Metal>> {
+        let resident_int8_quantizer = ActivationTransform::quantize_symmetric_plain(context, input_data_type, 32)
+            .map_err(MatmulError::BackendError)?;
+        Ok(Self {
             weights_data_type,
             input_data_type,
             output_data_type,
@@ -170,7 +178,43 @@ impl GemvDispatch {
                 input_data_type,
                 output_data_type,
             ),
-        }
+            resident_int8: ResidentInt8ExpertTensorOpsDispatch::new(
+                weights_data_type,
+                weights_data_type,
+                output_data_type,
+            ),
+            resident_int8_quantizer,
+        })
+    }
+
+    pub(crate) fn selects_resident_int8(
+        shape: &MatmulShape,
+        weights_data_type: DataType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+        ab_scale: f32,
+        gate_act: Option<GateActMulDOps>,
+        max_batch: u32,
+    ) -> bool {
+        let supported_transform = shape.d_transform.difference(GemmDTransform::BIAS).is_empty();
+        shape.expert_routed
+            && !shape.sparse_readout
+            && shape.a_full_precision
+            && shape.b_transpose
+            && shape.b_leading_dimension.is_none()
+            && shape.b_prologue == GemmBPrologueKind::ScaleSymmetricDequant
+            && shape.b_bits == Some(8)
+            && shape.b_group_size == Some(32)
+            && shape.signed_codes
+            && shape.m <= max_batch
+            && shape.n.is_multiple_of(32)
+            && shape.k.is_multiple_of(32)
+            && matches!(weights_data_type, DataType::BF16 | DataType::F32)
+            && matches!(input_data_type, DataType::BF16 | DataType::F32)
+            && matches!(output_data_type, DataType::BF16 | DataType::F32)
+            && ab_scale == 1.0
+            && gate_act.is_none()
+            && supported_transform
     }
 
     /// Selects one implementation inside the GEMV family.
@@ -183,7 +227,19 @@ impl GemvDispatch {
         gate_act: Option<GateActMulDOps>,
         device_profile: DeviceProfile,
         max_batch: u32,
+        int8_execution: Int8Execution,
     ) -> Option<GemvPlan> {
+        if Self::selects_resident_int8(
+            shape,
+            weights_data_type,
+            input_data_type,
+            output_data_type,
+            ab_scale,
+            gate_act,
+            max_batch,
+        ) {
+            return Some(GemvPlan::ResidentInt8(int8_execution));
+        }
         if let Some(spec) = Mxfp4ExpertDecodeGemvSpec::select(
             shape,
             weights_data_type,
@@ -237,6 +293,7 @@ impl GemvDispatch {
     ) -> Result<(), MatmulError<Metal>> {
         match plan.into() {
             GemvPlan::Mxfp4ExpertDecode(spec) => self.mxfp4_expert_decode.encode(arguments, spec, encoder),
+            GemvPlan::ResidentInt8(execution) => self.encode_resident_int8(arguments, execution, encoder),
             GemvPlan::Generic(specialization) => {
                 if arguments.d_transform.gate_act.is_some() {
                     return Err(MatmulError::UnsupportedDOp {
@@ -247,6 +304,91 @@ impl GemvDispatch {
                 self.encode_generic(arguments, specialization, encoder)
             },
         }
+    }
+
+    fn encode_resident_int8<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
+        &mut self,
+        arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
+        execution: Int8Execution,
+        encoder: &mut Encoder<Metal>,
+    ) -> Result<(), MatmulError<Metal>> {
+        let MatmulArguments {
+            a,
+            b,
+            d,
+            routing,
+            m,
+            n,
+            k,
+            d_transform,
+            ..
+        } = arguments;
+        let MatmulA::FullPrecision {
+            values: activations,
+            offset: 0,
+        } = a
+        else {
+            return Err(MatmulError::IncompatibleA {
+                path: "ResidentInt8TensorOps",
+                reason: "resident INT8 requires unshifted full-precision activations",
+            });
+        };
+        let MatmulB::ScaleSymmetricDequant {
+            b: weight_codes,
+            scales: weight_scales,
+            mode: QuantizationMode::I8,
+            group_size: 32,
+            signed_codes: true,
+        } = b
+        else {
+            return Err(MatmulError::UnsupportedRouting {
+                path: "ResidentInt8TensorOps",
+                reason: "resident INT8 requires native signed symmetric I8 group-32 expert weights",
+            });
+        };
+        let Some(routes) = routing.expert_routes() else {
+            return Err(MatmulError::UnsupportedRouting {
+                path: "ResidentInt8TensorOps",
+                reason: "resident INT8 requires direct expert routes",
+            });
+        };
+        let activation_rows = match routes.input {
+            ExpertInput::Routes => m,
+            ExpertInput::Tokens => m / routes.routes_per_token.get(),
+        };
+        let mut activation_codes = encoder
+            .allocate_scratch_for_shape(&[activation_rows, k], DataType::I8)
+            .map_err(MatmulError::BackendError)?;
+        let mut activation_scales = encoder
+            .allocate_scratch_for_shape(&[activation_rows, k / 32], DataType::F32)
+            .map_err(MatmulError::BackendError)?;
+        self.resident_int8_quantizer.encode_quantize_symmetric_plain(
+            activations,
+            &mut activation_codes,
+            &mut activation_scales,
+            activation_rows,
+            k,
+            encoder,
+        );
+        self.resident_int8
+            .encode(
+                weight_codes,
+                weight_scales,
+                &activation_codes,
+                &activation_scales,
+                &mut *d,
+                d_transform.per_matrix_bias,
+                routes.expert_ids,
+                k,
+                n,
+                m,
+                routes.routes_per_token,
+                routes.expert_count,
+                routes.input,
+                execution,
+                encoder,
+            )
+            .map_err(MatmulError::BackendError)
     }
 
     fn get_or_create(

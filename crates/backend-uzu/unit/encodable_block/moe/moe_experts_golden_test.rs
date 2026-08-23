@@ -6,9 +6,8 @@ use tempfile::NamedTempFile;
 
 use super::super::{experts::MoeExperts, router::MoeRoutes};
 use crate::{
-    ClippingBounds,
     backends::common::{Backend, Context, Encoder},
-    config::{activation::AnyActivation, weight_matrix::AnyWeightMatrixSpec},
+    config::{activation::AnyActivation, clipping::ClippingBounds, weight_matrix::AnyWeightMatrixSpec},
     data_type::DataType,
     encodable_block::linear::LinearMatmul,
     parameters::ParameterLoader,
@@ -167,8 +166,8 @@ fn run<B: Backend>() -> Vec<f32> {
         HIDDEN_DIM as u32,
         EXPERTS as u32,
         activation,
-        ClippingBounds::bounded(-1.5, 2.0),
-        ClippingBounds::bounded(-2.0, 2.5),
+        ClippingBounds::from(Some((Some(-1.5), Some(2.0)))),
+        ClippingBounds::from(Some((Some(-2.0), Some(2.5)))),
         DataType::F32,
     )
     .expect("construct experts");

@@ -88,6 +88,10 @@ pub async fn run_bench(
         .add_row(vec!["Total power, W", average_total_watts_metric.as_str()])
         .add_row(vec!["Total energy, J", energy_joules_metric.as_str()])
         .add_row(vec!["Energy per token, J/tok", joules_per_token_metric.as_str()]);
+    if let Some(execution) = first_result.int8_execution {
+        let execution = execution.to_string();
+        table.add_row(vec!["INT8 execution", execution.as_str()]);
+    }
     let Some(column) = table.column_mut(1) else {
         bail!("Benchmark summary table value column is missing");
     };

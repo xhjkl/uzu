@@ -1,11 +1,15 @@
+use half::{bf16, f16};
 use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Allocation, Backend,
+        Allocation, AllocationType, Backend, Context,
         gpu_types::{QuantizationMethod, QuantizationMode},
         kernel::matmul::MatmulB,
-        microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
+        microfloat::{
+            MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata, check_int32_accumulator_bound, e2m1_to_exact_i8,
+            mxfp4_exact_int8_scale,
+        },
     },
     config::weight_matrix::{
         AnyWeightMatrixSpec, Layout,
@@ -19,6 +23,8 @@ use crate::{
 pub enum WeightMatrixError<B: Backend> {
     #[error("Parameter loading error: {0}")]
     ParameterError(#[from] ParameterLoaderError<B>),
+    #[error("Backend error: {0}")]
+    BackendError(#[source] B::Error),
     #[error("Unsupported weight matrix configuration: {0}")]
     UnsupportedConfiguration(String),
 }
@@ -143,6 +149,7 @@ struct Quantized<B: Backend> {
 struct Microfloat<B: Backend> {
     scales: Allocation<B>,
     outer_scales: Allocation<B>,
+    outer_scale_data_type: DataType,
     metadata: MicrofloatMetadata,
 }
 
@@ -249,6 +256,7 @@ impl<B: Backend> WeightMatrix<B> {
                     microfloat: Microfloat {
                         scales,
                         outer_scales,
+                        outer_scale_data_type: data_type,
                         metadata,
                     },
                 },
@@ -459,6 +467,144 @@ impl<B: Backend> WeightMatrix<B> {
         }
     }
 
+    /// Replace canonical MXFP4 storage with its exact group-32 signed-INT8 form.
+    pub fn prepare_mxfp4_int8(
+        &mut self,
+        context: &B::Context,
+    ) -> Result<(), WeightMatrixError<B>> {
+        let WeightStorage::Microfloat {
+            values,
+            microfloat,
+        } = &self.storage
+        else {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "load-time INT8 preparation requires canonical MXFP4 storage".into(),
+            ));
+        };
+        let metadata = microfloat.metadata;
+        if metadata.format() != MicrofloatFormat::Mxfp4 || !matches!(metadata.group_size(), 16 | 32) {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "load-time INT8 preparation requires group-16 or group-32 E8M0 MXFP4 weights".into(),
+            ));
+        }
+        if !metadata.columns().is_multiple_of(32) {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "load-time INT8 preparation requires a K dimension divisible by 32".into(),
+            ));
+        }
+        check_int32_accumulator_bound(127, 12, 32)
+            .map_err(|error| WeightMatrixError::UnsupportedConfiguration(error.to_string()))?;
+
+        let source_codes = values.as_slice::<u8>();
+        let source_scales = microfloat.scales.as_slice::<u8>();
+        if source_scales.contains(&255) {
+            return Err(WeightMatrixError::UnsupportedConfiguration(
+                "cannot prepare an INT8 bank containing invalid E8M0 exponent 255".into(),
+            ));
+        }
+        let matrix_count = metadata.matrix_count() as usize;
+        let rows = metadata.rows() as usize;
+        let columns = metadata.columns() as usize;
+        let source_groups_per_row = metadata.scale_row_stride();
+        let target_groups_per_row = columns / 32;
+        let code_count = matrix_count
+            .checked_mul(rows)
+            .and_then(|count| count.checked_mul(columns))
+            .ok_or_else(|| WeightMatrixError::UnsupportedConfiguration("prepared code size overflows usize".into()))?;
+        let scale_count = matrix_count
+            .checked_mul(rows)
+            .and_then(|count| count.checked_mul(target_groups_per_row))
+            .ok_or_else(|| WeightMatrixError::UnsupportedConfiguration("prepared scale size overflows usize".into()))?;
+
+        let mut codes =
+            context.create_allocation(code_count, AllocationType::Global).map_err(WeightMatrixError::BackendError)?;
+        let mut decoded_scales = vec![0.0f32; scale_count];
+        let outer_scale = |matrix: usize| -> Result<f32, WeightMatrixError<B>> {
+            let scale = match microfloat.outer_scale_data_type {
+                DataType::F16 => microfloat.outer_scales.as_slice::<f16>()[matrix].to_f32(),
+                DataType::BF16 => microfloat.outer_scales.as_slice::<bf16>()[matrix].to_f32(),
+                DataType::F32 => microfloat.outer_scales.as_slice::<f32>()[matrix],
+                data_type => {
+                    return Err(WeightMatrixError::UnsupportedConfiguration(format!(
+                        "MXFP4 outer scale type {data_type:?} cannot be converted to an INT8 bank"
+                    )));
+                },
+            };
+            if !scale.is_finite() {
+                return Err(WeightMatrixError::UnsupportedConfiguration(
+                    "MXFP4 outer scales must be finite for an INT8 bank".into(),
+                ));
+            }
+            Ok(scale)
+        };
+
+        let codes_out = codes.as_slice_mut::<i8>();
+        for matrix in 0..matrix_count {
+            let outer_scale = outer_scale(matrix)?;
+            for row in 0..rows {
+                let source_code_row = matrix * metadata.code_matrix_stride() + row * metadata.code_row_stride();
+                let target_code_row = (matrix * rows + row) * columns;
+                for column in 0..columns {
+                    let packed = source_codes[source_code_row + column / 2];
+                    let code = if column.is_multiple_of(2) {
+                        packed & 0x0f
+                    } else {
+                        packed >> 4
+                    };
+                    codes_out[target_code_row + column] = e2m1_to_exact_i8(code);
+                }
+
+                let source_scale_row = matrix * metadata.scale_matrix_stride() + row * source_groups_per_row;
+                let target_scale_row = (matrix * rows + row) * target_groups_per_row;
+                for group in 0..target_groups_per_row {
+                    let source_group = group * (32 / metadata.group_size() as usize);
+                    let exponent = source_scales[source_scale_row + source_group];
+                    if metadata.group_size() == 16 && exponent != source_scales[source_scale_row + source_group + 1] {
+                        return Err(WeightMatrixError::UnsupportedConfiguration(
+                            "group-16 MXFP4 scales cannot be merged exactly into group-32 INT8 scales".into(),
+                        ));
+                    }
+                    decoded_scales[target_scale_row + group] = mxfp4_exact_int8_scale(exponent, outer_scale);
+                }
+            }
+        }
+
+        let scale_bytes = scale_count
+            .checked_mul(microfloat.outer_scale_data_type.size_in_bytes())
+            .ok_or_else(|| WeightMatrixError::UnsupportedConfiguration("prepared scale size overflows usize".into()))?;
+        let mut scales =
+            context.create_allocation(scale_bytes, AllocationType::Global).map_err(WeightMatrixError::BackendError)?;
+        match microfloat.outer_scale_data_type {
+            DataType::F16 => scales
+                .as_slice_mut::<f16>()
+                .iter_mut()
+                .zip(decoded_scales)
+                .for_each(|(output, scale)| *output = f16::from_f32(scale)),
+            DataType::BF16 => scales
+                .as_slice_mut::<bf16>()
+                .iter_mut()
+                .zip(decoded_scales)
+                .for_each(|(output, scale)| *output = bf16::from_f32(scale)),
+            DataType::F32 => scales.as_slice_mut::<f32>().copy_from_slice(&decoded_scales),
+            _ => unreachable!(),
+        }
+
+        self.storage = WeightStorage::Integer {
+            values: codes,
+            quantized: Quantized {
+                scales,
+                correction: QuantizedCorrection::Symmetric,
+                info: QuantizationInfo {
+                    mode: QuantizationMode::I8,
+                    method: QuantizationMethod::ScaleSymmetric,
+                    group_size: 32,
+                },
+                signed_codes: true,
+            },
+        };
+        Ok(())
+    }
+
     pub fn make_codes_signed(&mut self) {
         let WeightStorage::Integer {
             values,
@@ -597,3 +743,7 @@ mod tests {
         tree.assert_all_tensors_validated().expect("validate dense MXFP4 tensors");
     }
 }
+
+#[cfg(test)]
+#[path = "../../unit/encodable_block/weight_matrix_int8_test.rs"]
+mod int8_tests;
