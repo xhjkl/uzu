@@ -1,10 +1,10 @@
 #include <metal_stdlib>
 
-#include "../common/dsl.h"
-#include "../common/soft_cap.h"
-#include "../generated/gemm.h"
-#include "common/defines.h"
-#include "common/microfloat.h"
+#include "../../common/dsl.h"
+#include "../../common/soft_cap.h"
+#include "../../generated/gemm.h"
+#include "../common/defines.h"
+#include "../common/microfloat.h"
 
 using namespace metal;
 using namespace uzu::gemm;

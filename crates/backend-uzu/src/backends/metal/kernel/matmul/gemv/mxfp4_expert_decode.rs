@@ -23,9 +23,9 @@ use crate::{
 pub(crate) const MXFP4_EXPERT_DECODE_MAX_ROUTES: u32 = 8;
 
 fn mxfp4_decode_tile(profile: DeviceProfile) -> (u32, u32) {
-    let measured_m1_max =
+    let legacy_large_profile =
         profile.generation() == DeviceGeneration::Legacy && (30..=32).contains(&profile.gpu_core_count());
-    if measured_m1_max {
+    if legacy_large_profile {
         return (4, 4);
     }
 
@@ -139,7 +139,7 @@ mod tests {
     use super::*;
 
     #[uzu_test]
-    fn tuned_decode_tile_is_scoped_to_the_measured_m1_max_range() {
+    fn tuned_decode_tile_is_scoped_to_the_legacy_large_profile() {
         assert_eq!(mxfp4_decode_tile(DeviceProfile::new(32, DeviceGeneration::Legacy)), (4, 4));
         assert_eq!(mxfp4_decode_tile(DeviceProfile::new(64, DeviceGeneration::Legacy)), (1, 2));
         assert_eq!(mxfp4_decode_tile(DeviceProfile::new(32, DeviceGeneration::Apple8)), (1, 2));

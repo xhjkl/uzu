@@ -9,8 +9,7 @@ use crate::{
             Backend, Context, Encoder, Kernels,
             gpu_types::QuantizationMethod,
             kernel::matmul::{
-                ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
-                MatmulKernel, MatmulRouting,
+                ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting,
             },
         },
         cpu::Cpu,
@@ -72,7 +71,6 @@ fn run_quantized_routes<B: Backend>(
     let context = B::Context::new().expect("create backend context");
     let buffers = QuantBuffers::<B, bf16>::allocate(context.as_ref(), &input);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &expert_ids);
-    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, bf16>(context.as_ref(), ROUTES * n as usize);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::BF16, DataType::BF16, DataType::BF16)
@@ -93,7 +91,6 @@ fn run_quantized_routes<B: Backend>(
                 d: &mut output,
                 d_transform: MatmulDOps::none(),
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(EXPERTS as u32).unwrap(),
@@ -157,7 +154,6 @@ fn run_with_offset_and_output<B: Backend>(
     let input = alloc_allocation_with_data::<B, f32>(context.as_ref(), input);
     let weights = alloc_allocation_with_data::<B, f32>(context.as_ref(), weights);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), expert_ids);
-    let route_identity = ExpertRouteIdentity::new();
     let expert_biases = alloc_allocation_with_data::<B, f32>(context.as_ref(), expert_biases);
     let mut output = match initial_output {
         Some(initial_output) => {
@@ -189,7 +185,6 @@ fn run_with_offset_and_output<B: Backend>(
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(routes_per_token).unwrap(),
                     expert_count: NonZeroU32::new(expert_count).unwrap(),
@@ -216,7 +211,6 @@ fn rejection<B: Backend>(
     let input = alloc_allocation_with_data::<B, f32>(context.as_ref(), &[1.0, 2.0, 3.0]);
     let weights = alloc_allocation_with_data::<B, f32>(context.as_ref(), &vec![0.0; weight_count]);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &[0]);
-    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), 2);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -237,7 +231,6 @@ fn rejection<B: Backend>(
                 d: &mut output,
                 d_transform: MatmulDOps::none(),
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(expert_count).unwrap(),
@@ -262,7 +255,6 @@ fn storage_rejection<B: Backend>(
     let input = alloc_allocation_with_data::<B, f32>(context.as_ref(), &vec![1.0; input_count]);
     let weights = alloc_allocation_with_data::<B, f32>(context.as_ref(), &[1.0; 6]);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &[0]);
-    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, f32>(context.as_ref(), output_count);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
@@ -283,7 +275,6 @@ fn storage_rejection<B: Backend>(
                 d: &mut output,
                 d_transform: MatmulDOps::none(),
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(1).unwrap(),
@@ -318,7 +309,6 @@ fn run_bf16_offset<B: Backend>() -> Vec<bf16> {
     );
     let biases = alloc_allocation_with_data::<B, bf16>(context.as_ref(), &[bf16::from_f32(0.1), bf16::from_f32(0.2)]);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &[0]);
-    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, bf16>(context.as_ref(), 2);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::BF16, DataType::BF16, DataType::BF16)
@@ -342,7 +332,6 @@ fn run_bf16_offset<B: Backend>() -> Vec<bf16> {
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(1).unwrap(),
@@ -430,7 +419,6 @@ fn run_unaligned_bf16_grouped<B: Backend>() -> Vec<bf16> {
     let weights = alloc_allocation_with_data::<B, bf16>(context.as_ref(), &weights);
     let biases = alloc_allocation_with_data::<B, bf16>(context.as_ref(), &biases);
     let expert_ids = alloc_allocation_with_data::<B, i32>(context.as_ref(), &expert_ids);
-    let route_identity = ExpertRouteIdentity::new();
     let mut output = alloc_allocation::<B, bf16>(context.as_ref(), ROUTES * N);
     let mut kernel =
         <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::BF16, DataType::BF16, DataType::BF16)
@@ -455,7 +443,6 @@ fn run_unaligned_bf16_grouped<B: Backend>() -> Vec<bf16> {
                     ..MatmulDOps::none()
                 },
                 routing: MatmulRouting::Experts(ExpertRoutes {
-                    identity: &route_identity,
                     expert_ids: &expert_ids,
                     routes_per_token: NonZeroU32::new(1).unwrap(),
                     expert_count: NonZeroU32::new(EXPERTS as u32).unwrap(),

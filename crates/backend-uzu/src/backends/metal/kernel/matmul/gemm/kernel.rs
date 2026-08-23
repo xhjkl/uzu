@@ -2,6 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use super::{
     GemmEngine, GemmPlan,
+    routed::RoutedGemmDispatch,
     selection::{GemmProblem, outer_block_k},
     specialization::GemmSpecialization,
 };
@@ -37,6 +38,7 @@ pub struct GemmKernel {
     pub bias_add: TensorAddBiasMetalKernel,
     output_rht: ActivationTransform<Metal>,
     split_k_reduce: HashMap<GemmDTransform, GemmSplitKReduceMetalKernel>,
+    routed: RoutedGemmDispatch,
 }
 
 impl GemmKernel {
@@ -48,6 +50,7 @@ impl GemmKernel {
     ) -> Result<Self, MetalError> {
         let bias_add = TensorAddBiasMetalKernel::new(context, output_data_type, weights_data_type, true)?;
         let output_rht = ActivationTransform::output_rht(context, output_data_type, true)?;
+        let routed = RoutedGemmDispatch::new(context, weights_data_type, input_data_type, output_data_type)?;
         let kernel = Self {
             weights_data_type,
             input_data_type,
@@ -56,6 +59,7 @@ impl GemmKernel {
             bias_add,
             output_rht,
             split_k_reduce: HashMap::new(),
+            routed,
         };
         Ok(kernel)
     }
@@ -146,6 +150,9 @@ impl GemmKernel {
         encoder: &mut Encoder<Metal>,
     ) -> Result<(), MetalError> {
         let shape = MatmulShape::from_arguments(&arguments);
+        if arguments.routing.expert_routes().is_some() || shape.b_microfloat.is_some() {
+            return self.routed.encode(arguments, encoder).map_err(MetalError::from);
+        }
         self.problem(shape, encoder.context().supports_mxu(), encoder.context().device_profile())
             .validate_engine(plan.engine)
             .map_err(|error| MetalError::KernelDispatchFailed(Box::new(error)))?;

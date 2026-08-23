@@ -1,9 +1,4 @@
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-    num::NonZeroU32,
-    sync::Arc,
-};
+use std::num::NonZeroU32;
 
 use super::{MatmulA, MatmulArguments};
 use crate::backends::common::{
@@ -32,50 +27,6 @@ pub enum ExpertInput {
     Routes,
 }
 
-/// Stable ownership identity for one immutable expert-ID result.
-///
-/// Backend-private route plans retain a clone, so an identity cannot be
-/// recycled while a plan for it remains cached.
-#[derive(Clone)]
-pub struct ExpertRouteIdentity(Arc<ExpertRouteIdentityInner>);
-
-struct ExpertRouteIdentityInner;
-
-impl ExpertRouteIdentity {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(ExpertRouteIdentityInner))
-    }
-}
-
-impl fmt::Debug for ExpertRouteIdentity {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        formatter.debug_tuple("ExpertRouteIdentity").field(&Arc::as_ptr(&self.0)).finish()
-    }
-}
-
-impl PartialEq for ExpertRouteIdentity {
-    fn eq(
-        &self,
-        other: &Self,
-    ) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for ExpertRouteIdentity {}
-
-impl Hash for ExpertRouteIdentity {
-    fn hash<H: Hasher>(
-        &self,
-        state: &mut H,
-    ) {
-        Arc::as_ptr(&self.0).hash(state);
-    }
-}
-
 /// Direct route-major expert selection for a banked B operand.
 ///
 /// `expert_ids` contains at least `M` native `i32` values in token-major, route-major
@@ -83,7 +34,6 @@ impl Hash for ExpertRouteIdentity {
 /// always corresponds to route `r`; there are no public offsets or permutations.
 /// Invalid IDs produce an all-zero output row. Empty experts need no representation.
 pub struct ExpertRoutes<'a, B: Backend> {
-    pub identity: &'a ExpertRouteIdentity,
     pub expert_ids: &'a Allocation<B>,
     pub routes_per_token: NonZeroU32,
     pub expert_count: NonZeroU32,
@@ -183,26 +133,5 @@ impl MatmulShape {
 
     pub fn is_integer_quantized(&self) -> bool {
         self.b_prologue != GemmBPrologueKind::FullPrecision
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use proc_macros::uzu_test;
-
-    use super::ExpertRouteIdentity;
-
-    #[uzu_test]
-    fn retained_route_identities_cannot_be_recycled() {
-        let first = ExpertRouteIdentity::new();
-        let retained = first.clone();
-        drop(first);
-        let second = ExpertRouteIdentity::new();
-
-        assert_ne!(retained, second);
-        assert_eq!(HashSet::from([retained.clone(), retained]).len(), 1);
-        assert_eq!(HashSet::from([second]).len(), 1);
     }
 }

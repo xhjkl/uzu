@@ -1,6 +1,9 @@
 use std::collections::{HashMap, hash_map::Entry};
 
-use super::policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK};
+use super::{
+    mxfp4_expert_decode::{Mxfp4ExpertDecodeGemvDispatch, Mxfp4ExpertDecodeGemvSpec},
+    policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK},
+};
 use crate::{
     backends::{
         common::{
@@ -9,7 +12,9 @@ use crate::{
                 HADAMARD_TRANSFORM_BLOCK_SIZE,
                 gemm::{GemmBPrologueKind, GemmDTransform},
             },
-            kernel::matmul::{ExpertInput, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
+            kernel::matmul::{
+                ExpertInput, GateActMulDOps, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape,
+            },
         },
         metal::{Metal, context::MetalContext, device_profile::DeviceProfile, kernel::GemvMetalKernel},
     },
@@ -134,6 +139,19 @@ pub(crate) struct GemvDispatch {
     input_data_type: DataType,
     output_data_type: DataType,
     pipelines: HashMap<GemvSpecialization, GemvMetalKernel>,
+    mxfp4_expert_decode: Mxfp4ExpertDecodeGemvDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GemvPlan {
+    Generic(GemvSpecialization),
+    Mxfp4ExpertDecode(Mxfp4ExpertDecodeGemvSpec),
+}
+
+impl From<GemvSpecialization> for GemvPlan {
+    fn from(specialization: GemvSpecialization) -> Self {
+        Self::Generic(specialization)
+    }
 }
 
 impl GemvDispatch {
@@ -147,6 +165,87 @@ impl GemvDispatch {
             input_data_type,
             output_data_type,
             pipelines: HashMap::new(),
+            mxfp4_expert_decode: Mxfp4ExpertDecodeGemvDispatch::new(
+                weights_data_type,
+                input_data_type,
+                output_data_type,
+            ),
+        }
+    }
+
+    /// Selects one implementation inside the GEMV family.
+    pub(crate) fn select(
+        shape: &MatmulShape,
+        weights_data_type: DataType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+        ab_scale: f32,
+        gate_act: Option<GateActMulDOps>,
+        device_profile: DeviceProfile,
+        max_batch: u32,
+    ) -> Option<GemvPlan> {
+        if let Some(spec) = Mxfp4ExpertDecodeGemvSpec::select(
+            shape,
+            weights_data_type,
+            input_data_type,
+            output_data_type,
+            ab_scale,
+            gate_act,
+            device_profile,
+        ) {
+            return Some(GemvPlan::Mxfp4ExpertDecode(spec));
+        }
+        GemvSpecialization::select_shape(
+            shape,
+            weights_data_type,
+            input_data_type,
+            output_data_type,
+            device_profile,
+            max_batch,
+        )
+        .map(GemvPlan::Generic)
+    }
+
+    pub(crate) fn supports_fused_gate_act(
+        shape: &MatmulShape,
+        weights_data_type: DataType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+        device_profile: DeviceProfile,
+    ) -> bool {
+        Mxfp4ExpertDecodeGemvSpec::select(
+            shape,
+            weights_data_type,
+            input_data_type,
+            output_data_type,
+            1.0,
+            Some(GateActMulDOps {
+                activation_alpha: None,
+                gate_clipping: None,
+                value_clipping: None,
+            }),
+            device_profile,
+        )
+        .is_some()
+    }
+
+    pub(crate) fn encode<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
+        &mut self,
+        arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
+        plan: impl Into<GemvPlan>,
+        encoder: &mut Encoder<Metal>,
+    ) -> Result<(), MatmulError<Metal>> {
+        match plan.into() {
+            GemvPlan::Mxfp4ExpertDecode(spec) => self.mxfp4_expert_decode.encode(arguments, spec, encoder),
+            GemvPlan::Generic(specialization) => {
+                if arguments.d_transform.gate_act.is_some() {
+                    return Err(MatmulError::UnsupportedDOp {
+                        bit: GemmDTransform::GATE_ACT_MUL,
+                        path: "Gemv",
+                    });
+                }
+                self.encode_generic(arguments, specialization, encoder)
+            },
         }
     }
 
@@ -183,7 +282,7 @@ impl GemvDispatch {
         }
     }
 
-    pub(crate) fn encode<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
+    fn encode_generic<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
         &mut self,
         arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
         specialization: GemvSpecialization,
