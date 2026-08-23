@@ -6,7 +6,7 @@ use crate::{
             BufferArg, Encoder,
             gpu_types::gemm::GemmDTransform,
             kernel::matmul::{GateActMulDOps, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
-            microfloat::MicrofloatLayout,
+            microfloat::{MicrofloatLayout, MicrofloatScaleFormat},
         },
         metal::{
             Metal,
@@ -44,6 +44,7 @@ pub(crate) struct Mxfp4ExpertDecodeGemvSpec {
     clip_gate: bool,
     clip_value: bool,
     fused_gate_up: bool,
+    scale_format: MicrofloatScaleFormat,
 }
 
 impl Mxfp4ExpertDecodeGemvSpec {
@@ -65,9 +66,13 @@ impl Mxfp4ExpertDecodeGemvSpec {
         {
             return None;
         }
-        if metadata.layout() != MicrofloatLayout::OutputInput || !matches!(metadata.group_size(), 16 | 32) {
+        if metadata.layout() != MicrofloatLayout::OutputInput {
             return None;
         }
+        if !matches!(metadata.group_size(), 16 | 32) {
+            return None;
+        }
+        let scale_format = metadata.scale_format();
         if metadata.rows() != shape.n || metadata.columns() != shape.k {
             return None;
         }
@@ -99,6 +104,7 @@ impl Mxfp4ExpertDecodeGemvSpec {
                 clip_gate: gate_act.gate_clipping.is_some(),
                 clip_value: gate_act.value_clipping.is_some(),
                 fused_gate_up: true,
+                scale_format,
             });
         }
         if !matches!(output_data_type, DataType::F32 | DataType::BF16) {
@@ -119,6 +125,7 @@ impl Mxfp4ExpertDecodeGemvSpec {
             clip_gate: false,
             clip_value: false,
             fused_gate_up: false,
+            scale_format,
         })
     }
 
@@ -175,6 +182,7 @@ impl Mxfp4ExpertDecodeGemvDispatch {
         match self.pipelines.entry(spec) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
+                let scale_e4m3 = spec.scale_format == MicrofloatScaleFormat::E4m3;
                 let kernel = Mxfp4ExpertDecodeGemvMetalKernel::new(
                     context,
                     self.input_data_type,
@@ -184,6 +192,7 @@ impl Mxfp4ExpertDecodeGemvDispatch {
                     spec.rows_per_simdgroup,
                     spec.num_simdgroups,
                     spec.fused_gate_up,
+                    scale_e4m3,
                     spec.expert_bias,
                     spec.custom_activation_alpha,
                     spec.clip_gate,

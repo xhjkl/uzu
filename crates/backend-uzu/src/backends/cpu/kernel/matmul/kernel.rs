@@ -473,9 +473,10 @@ impl MatmulKernel for MatmulCpuKernel {
                                     let scale_index = matrix * metadata.scale_matrix_stride()
                                         + b_col * metadata.scale_row_stride()
                                         + inner / metadata.group_size() as usize;
-                                    let exponent = *scales.as_ptr().add(scale_index);
+                                    let scale = *scales.as_ptr().add(scale_index);
                                     let outer_scale = read_f32(outer_scales.as_ptr(), weights_data_type, matrix);
-                                    crate::backends::common::microfloat::decode_mxfp4(code, exponent, outer_scale)
+                                    let value = crate::backends::common::microfloat::decode_e2m1(code);
+                                    value * metadata.scale_format().decode(scale) * outer_scale
                                 },
                             };
                             accumulator += a_value * b_value;

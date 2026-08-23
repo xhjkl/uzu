@@ -10,7 +10,7 @@ use crate::{
             kernel::matmul::{
                 ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting,
             },
-            microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata, decode_mxfp4},
+            microfloat::{MicrofloatLayout, MicrofloatMetadata, MicrofloatScaleFormat, decode_e2m1},
         },
         cpu::Cpu,
     },
@@ -102,7 +102,7 @@ fn run<B: Backend>(
         })
         .collect();
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         group_size,
         MicrofloatLayout::OutputInput,
@@ -182,7 +182,9 @@ fn run<B: Backend>(
                     packed >> 4
                 };
                 let scale_index = (expert * N + row) * K / group_size as usize + inner / group_size as usize;
-                value += input[input_row * K + inner] * decode_mxfp4(code, scales[scale_index], outer_scales[expert]);
+                let weight =
+                    decode_e2m1(code) * MicrofloatScaleFormat::E8m0.decode(scales[scale_index]) * outer_scales[expert];
+                value += input[input_row * K + inner] * weight;
             }
             expected[route * N + row] = value;
         }
@@ -199,7 +201,7 @@ fn run_dense<B: Backend>(
     let scales: Vec<u8> = (0..N * K / group_size as usize).map(|index| 126 + (index % 3) as u8).collect();
     let outer_scales = [1.25f32];
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         group_size,
         MicrofloatLayout::OutputInput,
@@ -259,7 +261,8 @@ fn run_dense<B: Backend>(
                     packed >> 4
                 };
                 let scale_index = output_row * K / group_size as usize + inner / group_size as usize;
-                let weight = decode_mxfp4(code, scales[scale_index], outer_scales[0]);
+                let weight =
+                    decode_e2m1(code) * MicrofloatScaleFormat::E8m0.decode(scales[scale_index]) * outer_scales[0];
                 value += input[row * K + inner] * weight;
             }
             expected[row * N + output_row] = value;
@@ -298,7 +301,7 @@ fn run_sparse_readout<B: Backend>(
         })
         .collect();
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         group_size,
         MicrofloatLayout::OutputInput,
@@ -361,7 +364,8 @@ fn run_sparse_readout<B: Backend>(
                     packed >> 4
                 };
                 let scale_index = physical_row * K / group_size as usize + inner / group_size as usize;
-                let weight = decode_mxfp4(code, scales[scale_index], outer_scales[0]);
+                let weight =
+                    decode_e2m1(code) * MicrofloatScaleFormat::E8m0.decode(scales[scale_index]) * outer_scales[0];
                 expected[input_row * readout_row_count + readout_row] += input[input_row * K + inner] * weight;
             }
         }
@@ -386,7 +390,7 @@ fn run_tiny_output<B: Backend>(
     let biases: Vec<f32> = (0..EXPERTS * n).map(|index| index as f32 * 0.01 - 0.02).collect();
     let expert_ids = [2, 0, 1];
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         16,
         MicrofloatLayout::OutputInput,
@@ -465,7 +469,7 @@ fn run_external_fixture<B: Backend>() -> Vec<f32> {
     let input = bf16_fixture(&GPT_OSS_INPUT_BF16);
     let biases = bf16_fixture(&GPT_OSS_BIASES_BF16);
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         32,
         MicrofloatLayout::OutputInput,
@@ -560,7 +564,7 @@ fn rejection<B: Backend>(
     expert_count: u32,
 ) -> String {
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         16,
         MicrofloatLayout::OutputInput,

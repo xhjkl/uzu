@@ -232,7 +232,12 @@ impl Compiler for MetalCompiler {
             .map(|e| e.into_path())
             .collect();
 
-        let num_concurrent_compiles = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4) * 2;
+        let default_concurrent_compiles = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4) * 2;
+        let num_concurrent_compiles = env::var("UZU_METAL_BUILD_JOBS")
+            .ok()
+            .and_then(|jobs| jobs.parse().ok())
+            .filter(|jobs| *jobs > 0)
+            .unwrap_or(default_concurrent_compiles);
 
         let compiled: Vec<(KernelPath, Box<[Kernel]>, bool)> = stream::iter(metal_sources)
             .map(|path| async move {

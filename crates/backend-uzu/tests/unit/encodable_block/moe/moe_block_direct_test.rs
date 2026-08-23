@@ -138,6 +138,23 @@ fn fixture_e2m1(code: u8) -> f32 {
     VALUES[usize::from(code)]
 }
 
+fn independent_e4m3(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let exponent = (bits >> 3) & 0x0f;
+    let mantissa = bits & 0x07;
+    if exponent == 0 {
+        return sign * f32::from(mantissa) / 512.0;
+    }
+    if exponent == 15 && mantissa == 7 {
+        return f32::NAN;
+    }
+    sign * 2.0f32.powi(i32::from(exponent) - 7) * (1.0 + f32::from(mantissa) / 8.0)
+}
+
 fn fixture_microfloat_weight(
     up_projection: bool,
     expert: usize,
@@ -462,16 +479,231 @@ fn integer_parameter_file(spec: IntegerExpertSpec) -> NamedTempFile {
     write_parameter_file(header, &payload)
 }
 
+fn fixture_nvfp4_weight(
+    up_projection: bool,
+    expert: usize,
+    row: usize,
+    column: usize,
+) -> f32 {
+    let (rows, columns) = if up_projection {
+        ((2 * HIDDEN_DIM) as usize, MODEL_DIM as usize)
+    } else {
+        (MODEL_DIM as usize, HIDDEN_DIM as usize)
+    };
+    let group_size = 16usize;
+    let element = (expert * rows + row) * columns + column;
+    let byte = element / 2;
+    let (low, high, scale, outer_scale) = if up_projection {
+        (
+            (byte % 7 + 1) as u8,
+            ((byte * 3 + 1) % 7 + 1) as u8,
+            0x20 + (((expert * rows + row) * (columns / group_size) + column / group_size) % 4) as u8,
+            [0.5, 0.75, 1.0, 1.25][expert],
+        )
+    } else {
+        (
+            ((byte * 5 + 2) % 7 + 1) as u8,
+            ((byte * 7 + 3) % 7 + 1) as u8,
+            0x28 + (((expert * rows + row) * (columns / group_size) + column / group_size) % 3) as u8,
+            [1.0, 0.75, 0.5, 0.25][expert],
+        )
+    };
+    let code = if column.is_multiple_of(2) {
+        low
+    } else {
+        high
+    };
+    fixture_e2m1(code) * independent_e4m3(scale) * outer_scale
+}
+
+fn independent_nvfp4_output(token_count: usize) -> Vec<bf16> {
+    let input: Vec<f32> = (0..token_count * MODEL_DIM as usize)
+        .map(|index| bf16::from_f32((index % 17) as f32 * 0.03 - 0.2).to_f32())
+        .collect();
+    let mut output = vec![0.0f32; token_count * MODEL_DIM as usize];
+
+    for token in 0..token_count {
+        let input_first = input[token * MODEL_DIM as usize];
+        let experts = if input_first < 0.0 {
+            [0usize, 1]
+        } else {
+            [2usize, 3]
+        };
+        let logits = experts.map(|expert| input_first * ROUTER_SLOPES[expert]);
+        let denominator = logits[0].exp() + logits[1].exp();
+        let route_weights = logits.map(|logit| bf16::from_f32(logit.exp() / denominator).to_f32());
+
+        for (expert, route_weight) in experts.into_iter().zip(route_weights) {
+            let mut fused_up = vec![0.0f32; (2 * HIDDEN_DIM) as usize];
+            for row in 0..(2 * HIDDEN_DIM) as usize {
+                let bias =
+                    bf16::from_f32(((expert * (2 * HIDDEN_DIM) as usize + row) % 9) as f32 * 0.005 - 0.02).to_f32();
+                fused_up[row] = (0..MODEL_DIM as usize).fold(bias, |sum, column| {
+                    sum + input[token * MODEL_DIM as usize + column] * fixture_nvfp4_weight(true, expert, row, column)
+                });
+            }
+            let hidden: Vec<f32> = (0..HIDDEN_DIM as usize)
+                .map(|column| {
+                    let value = fused_up[column].clamp(-2.0, 2.5);
+                    let gate = fused_up[HIDDEN_DIM as usize + column].clamp(-1.5, 2.0);
+                    value * gate / (1.0 + (-0.75 * gate).exp())
+                })
+                .collect();
+            for row in 0..MODEL_DIM as usize {
+                let bias = bf16::from_f32(((expert * MODEL_DIM as usize + row) % 7) as f32 * 0.004 - 0.012).to_f32();
+                let down = (0..HIDDEN_DIM as usize)
+                    .fold(bias, |sum, column| sum + hidden[column] * fixture_nvfp4_weight(false, expert, row, column));
+                output[token * MODEL_DIM as usize + row] += route_weight * bf16::from_f32(down).to_f32();
+            }
+        }
+    }
+    output.into_iter().map(bf16::from_f32).collect()
+}
+
+fn nvfp4_parameter_file() -> NamedTempFile {
+    let mut header = Map::new();
+    header.insert(
+        "__metadata__".into(),
+        json!({
+            "router.weights.spec": json!({
+                "type": "FullPrecisionSpec",
+                "layout": "output_input"
+            }).to_string(),
+            "experts.up_projection.weights.spec": json!({
+                "type": "MicrofloatSpec",
+                "bits": 4,
+                "group_size": 16,
+                "scale_mode": "nvfp4",
+                "layout": "output_input"
+            }).to_string(),
+            "experts.down_projection.weights.spec": json!({
+                "type": "MicrofloatSpec",
+                "bits": 4,
+                "group_size": 16,
+                "scale_mode": "nvfp4",
+                "layout": "output_input"
+            }).to_string()
+        }),
+    );
+    let mut payload = Vec::new();
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "router.weights.weights",
+        vec![EXPERTS, MODEL_DIM],
+        DataType::BF16,
+        bf16_bytes((0..EXPERTS as usize * MODEL_DIM as usize).map(|index| {
+            if index.is_multiple_of(MODEL_DIM as usize) {
+                ROUTER_SLOPES[index / MODEL_DIM as usize]
+            } else {
+                0.0
+            }
+        })),
+    );
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "router.biases",
+        vec![EXPERTS],
+        DataType::BF16,
+        bf16_bytes([0.0; EXPERTS as usize]),
+    );
+
+    let up_code_count = (EXPERTS * 2 * HIDDEN_DIM * MODEL_DIM / 2) as usize;
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.up_projection.weights.weights",
+        vec![EXPERTS, 2 * HIDDEN_DIM, MODEL_DIM / 2],
+        DataType::U8,
+        (0..up_code_count).map(|index| ((index % 7 + 1) | (((index * 3 + 1) % 7 + 1) << 4)) as u8).collect(),
+    );
+    let up_scale_count = (EXPERTS * 2 * HIDDEN_DIM * MODEL_DIM / 16) as usize;
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.up_projection.weights.scales",
+        vec![EXPERTS, 2 * HIDDEN_DIM, MODEL_DIM / 16],
+        DataType::U8,
+        (0..up_scale_count).map(|index| 0x20 + (index % 4) as u8).collect(),
+    );
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.up_projection.weights.global_scale",
+        vec![EXPERTS],
+        DataType::BF16,
+        bf16_bytes([0.5, 0.75, 1.0, 1.25]),
+    );
+
+    let down_code_count = (EXPERTS * MODEL_DIM * HIDDEN_DIM / 2) as usize;
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.down_projection.weights.weights",
+        vec![EXPERTS, MODEL_DIM, HIDDEN_DIM / 2],
+        DataType::U8,
+        (0..down_code_count)
+            .map(|index| (((index * 5 + 2) % 7 + 1) | (((index * 7 + 3) % 7 + 1) << 4)) as u8)
+            .collect(),
+    );
+    let down_scale_count = (EXPERTS * MODEL_DIM * HIDDEN_DIM / 16) as usize;
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.down_projection.weights.scales",
+        vec![EXPERTS, MODEL_DIM, HIDDEN_DIM / 16],
+        DataType::U8,
+        (0..down_scale_count).map(|index| 0x28 + (index % 3) as u8).collect(),
+    );
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.down_projection.weights.global_scale",
+        vec![EXPERTS],
+        DataType::BF16,
+        bf16_bytes([1.0, 0.75, 0.5, 0.25]),
+    );
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.up_projection.biases",
+        vec![EXPERTS, 2 * HIDDEN_DIM],
+        DataType::BF16,
+        bf16_bytes((0..EXPERTS * 2 * HIDDEN_DIM).map(|index| ((index % 9) as f32 - 4.0) * 0.005)),
+    );
+    add_tensor(
+        &mut header,
+        &mut payload,
+        "experts.down_projection.biases",
+        vec![EXPERTS, MODEL_DIM],
+        DataType::BF16,
+        bf16_bytes((0..EXPERTS * MODEL_DIM).map(|index| ((index % 7) as f32 - 3.0) * 0.004)),
+    );
+    write_parameter_file(header, &payload)
+}
+
 fn run<B: Backend>(
     token_count: u32,
     microfloat: bool,
 ) -> Vec<bf16> {
-    let context = B::Context::new().expect("create context");
     let file = if microfloat {
         microfloat_parameter_file()
     } else {
         parameter_file(DataType::BF16)
     };
+    run_file::<B>(token_count, file)
+}
+
+fn run_nvfp4<B: Backend>(token_count: u32) -> Vec<bf16> {
+    run_file::<B>(token_count, nvfp4_parameter_file())
+}
+
+fn run_file<B: Backend>(
+    token_count: u32,
+    file: NamedTempFile,
+) -> Vec<bf16> {
+    let context = B::Context::new().expect("create context");
     let loader = ParameterLoader::<B>::new(file.as_file(), context.as_ref()).expect("load parameters");
     let tree = loader.tree();
     let block =
@@ -579,6 +811,43 @@ fn integer_expert_artifacts_cover_decode_and_prefill() {
             });
         }
     }
+}
+
+#[uzu_test]
+fn nvfp4_experts_cover_decode_and_prefill() {
+    for token_count in [1, 33, 257] {
+        let expected = run_nvfp4::<crate::backends::cpu::Cpu>(token_count);
+        for_each_non_cpu_backend!(|B| {
+            let actual = run_nvfp4::<B>(token_count);
+            assert_eq_float(&expected, &actual, 0.15, "NVFP4 MoeBlock routes");
+        });
+    }
+}
+
+#[uzu_test]
+fn nvfp4_experts_match_an_independent_scalar_oracle() {
+    let expected = independent_nvfp4_output(2);
+    let actual = run_nvfp4::<crate::backends::cpu::Cpu>(2);
+    assert_eq_float(&expected, &actual, 0.15, "scalar NVFP4 MoeBlock oracle");
+    for_each_non_cpu_backend!(|B| {
+        let actual = run_nvfp4::<B>(2);
+        assert_eq_float(&expected, &actual, 0.15, "scalar NVFP4 MoeBlock oracle");
+    });
+}
+
+#[uzu_test]
+fn nvfp4_weights_are_rejected_outside_expert_banks() {
+    let context = <crate::backends::cpu::Cpu as Backend>::Context::new().expect("create context");
+    let file = nvfp4_parameter_file();
+    let loader = ParameterLoader::<crate::backends::cpu::Cpu>::new(file.as_file(), context.as_ref())
+        .expect("load NVFP4 parameters");
+    let tree = loader.tree().subtree("experts").subtree("up_projection").subtree("weights");
+    let spec = tree.metadata::<AnyWeightMatrixSpec>("spec").expect("NVFP4 spec");
+    let error = WeightMatrix::load(&tree, spec, Layout::OutputInput, 2 * HIDDEN_DIM, MODEL_DIM, DataType::BF16);
+    let Err(error) = error else {
+        panic!("unbanked NVFP4 matrix was accepted");
+    };
+    assert!(error.to_string().contains("only for expert matrix banks"), "{error}");
 }
 
 #[uzu_test]

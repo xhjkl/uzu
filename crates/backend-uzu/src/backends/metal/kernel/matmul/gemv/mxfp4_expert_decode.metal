@@ -4,14 +4,15 @@
 
 using namespace metal;
 
-// Decode-specialized, route-direct, block-native MXFP4 expert GEMV.
+// Decode-specialized, route-direct, block-native microfloat expert GEMV.
 //
-// Selected only for small expert-routed MXFP4 projections (see
+// Selected only for small expert-routed MXFP4/NVFP4 projections (see
 // Mxfp4ExpertDecodeGemvSpec::select in gemv/mxfp4_expert_decode.rs). Geometry
 // follows the proven llama.cpp mul_mv layout: two lanes own one physical
-// 32-value MXFP4 block, E2M1 decode goes through a threadgroup LUT, block
+// 32-value E2M1 block, E2M1 decode goes through a threadgroup LUT, block
 // scales are applied once per scale group, and activations are vector-loaded
-// once per block and reused across the rows owned by a simdgroup.
+// once per block and reused across the rows owned by a simdgroup. MXFP4 uses
+// E8M0 and E4M3 scales are each instantiated independently of group size.
 template <
     typename AT,
     typename BT,
@@ -19,7 +20,8 @@ template <
     uint GROUP_SIZE,
     uint ROWS_PER_SIMDGROUP,
     uint NUM_SIMDGROUPS,
-    bool FUSED_GATE_UP>
+    bool FUSED_GATE_UP,
+    bool SCALE_E4M3>
 VARIANTS(AT, bfloat, float)
 VARIANTS(BT, bfloat, float)
 VARIANTS(DT, float, bfloat)
@@ -27,6 +29,7 @@ VARIANTS(GROUP_SIZE, 16, 32)
 VARIANTS(ROWS_PER_SIMDGROUP, 1, 2, 4)
 VARIANTS(NUM_SIMDGROUPS, 2, 4)
 VARIANTS(FUSED_GATE_UP, false, true)
+VARIANTS(SCALE_E4M3, false, true)
 // The fused epilogue computes value/gate row pairs and writes SiLU-activated
 // F32 hidden rows; it requires row pairs and the production W13 dtypes.
 CONSTRAINT(!FUSED_GATE_UP || (AT == "bfloat" && DT == "float"))
@@ -144,14 +147,34 @@ KERNEL(Mxfp4ExpertDecodeGemv)(
       }
       const device uint8_t* row_codes = code_bank + size_t(weight_row) * code_row_bytes;
       const uint2 packed = *reinterpret_cast<const device uint2*>(row_codes + size_t(block * 16 + block_half * 8));
-      const float4 d0 = float4(e2m1_lut[packed.x & 0xFu], e2m1_lut[(packed.x >> 4u) & 0xFu], e2m1_lut[(packed.x >> 8u) & 0xFu], e2m1_lut[(packed.x >> 12u) & 0xFu]);
-      const float4 d1 = float4(e2m1_lut[(packed.x >> 16u) & 0xFu], e2m1_lut[(packed.x >> 20u) & 0xFu], e2m1_lut[(packed.x >> 24u) & 0xFu], e2m1_lut[packed.x >> 28u]);
-      const float4 d2 = float4(e2m1_lut[packed.y & 0xFu], e2m1_lut[(packed.y >> 4u) & 0xFu], e2m1_lut[(packed.y >> 8u) & 0xFu], e2m1_lut[(packed.y >> 12u) & 0xFu]);
-      const float4 d3 = float4(e2m1_lut[(packed.y >> 16u) & 0xFu], e2m1_lut[(packed.y >> 20u) & 0xFu], e2m1_lut[(packed.y >> 24u) & 0xFu], e2m1_lut[packed.y >> 28u]);
+      const float4 d0 = float4(
+          e2m1_lut[packed.x & 0xFu],
+          e2m1_lut[(packed.x >> 4u) & 0xFu],
+          e2m1_lut[(packed.x >> 8u) & 0xFu],
+          e2m1_lut[(packed.x >> 12u) & 0xFu]
+      );
+      const float4 d1 = float4(
+          e2m1_lut[(packed.x >> 16u) & 0xFu],
+          e2m1_lut[(packed.x >> 20u) & 0xFu],
+          e2m1_lut[(packed.x >> 24u) & 0xFu],
+          e2m1_lut[packed.x >> 28u]
+      );
+      const float4 d2 = float4(
+          e2m1_lut[packed.y & 0xFu],
+          e2m1_lut[(packed.y >> 4u) & 0xFu],
+          e2m1_lut[(packed.y >> 8u) & 0xFu],
+          e2m1_lut[(packed.y >> 12u) & 0xFu]
+      );
+      const float4 d3 = float4(
+          e2m1_lut[(packed.y >> 16u) & 0xFu],
+          e2m1_lut[(packed.y >> 20u) & 0xFu],
+          e2m1_lut[(packed.y >> 24u) & 0xFu],
+          e2m1_lut[packed.y >> 28u]
+      );
 
       const device uint8_t* row_scales = scale_bank + size_t(weight_row) * scale_row_bytes;
       const uint scale_index = GROUP_SIZE == 16 ? block * 2 + block_half : block;
-      const float block_scale = uzu::gemm::decode_e8m0(row_scales[scale_index]) * outer_scale;
+      const float block_scale = uzu::gemm::decode_group_scale<SCALE_E4M3>(row_scales[scale_index]) * outer_scale;
 
       const float4 partial = y0 * d0 + y1 * d1 + y2 * d2 + y3 * d3;
       row_sum[row] += block_scale * ((partial.x + partial.y) + (partial.z + partial.w));

@@ -12,7 +12,8 @@ template <
     uint GROUP_SIZE,
     uint K_SPLIT,
     uint RESULTS_PER_SIMDGROUP,
-    bool INPUT_ALIGNED>
+    bool INPUT_ALIGNED,
+    bool SCALE_E4M3>
 struct MicrofloatBSource {
   static METAL_FUNC void accumulate(
       thread U (&result)[RESULTS_PER_SIMDGROUP],
@@ -55,13 +56,15 @@ struct MicrofloatBSource {
         const size_t bank_row = size_t(matrix) * size_t(out_vec_size) + size_t(matrix_row);
         const device uint8_t* row_codes = codes + bank_row * size_t(code_row_stride);
         const device uint8_t* row_scales = scales + bank_row * size_t(scale_row_stride);
-        const uint exponent = row_scales[column / GROUP_SIZE];
+        const uint scale = row_scales[column / GROUP_SIZE];
+        const U decoded_scale = static_cast<U>(decode_group_scale<SCALE_E4M3>(scale));
         METAL_PRAGMA_UNROLL
         for (uint index = 0; index < values_per_thread; index++) {
           const uint inner = column + index;
           const uint packed = row_codes[inner / 2];
           const uint code = (inner & 1u) == 0u ? packed & 0x0fu : packed >> 4u;
-          result[row] += static_cast<U>(input[index]) * static_cast<U>(decode_mxfp4(code, exponent, outer_scale));
+          const U weight = static_cast<U>(decode_e2m1(code)) * decoded_scale * outer_scale;
+          result[row] += static_cast<U>(input[index]) * weight;
         }
       }
     }
@@ -83,12 +86,14 @@ struct MicrofloatBSource {
           const size_t bank_row = size_t(matrix) * size_t(out_vec_size) + size_t(matrix_row);
           const device uint8_t* row_codes = codes + bank_row * size_t(code_row_stride);
           const device uint8_t* row_scales = scales + bank_row * size_t(scale_row_stride);
-          const uint exponent = row_scales[column / GROUP_SIZE];
+          const uint scale = row_scales[column / GROUP_SIZE];
+          const U decoded_scale = static_cast<U>(decode_group_scale<SCALE_E4M3>(scale));
           for (int index = 0; index < remaining; index++) {
             const uint inner = column + static_cast<uint>(index);
             const uint packed = row_codes[inner / 2];
             const uint code = (inner & 1u) == 0u ? packed & 0x0fu : packed >> 4u;
-            result[row] += static_cast<U>(input[index]) * static_cast<U>(decode_mxfp4(code, exponent, outer_scale));
+            const U weight = static_cast<U>(decode_e2m1(code)) * decoded_scale * outer_scale;
+            result[row] += static_cast<U>(input[index]) * weight;
           }
         }
       }

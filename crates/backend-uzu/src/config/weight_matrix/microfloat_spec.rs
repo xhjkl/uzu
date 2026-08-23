@@ -46,19 +46,26 @@ mod tests {
     }
 
     #[uzu_test]
-    fn rejects_unsupported_runtime_formats() {
-        let spec: AnyWeightMatrixSpec = serde_json::from_value(json!({
-            "type": "MicrofloatSpec",
-            "bits": 4,
-            "group_size": 16,
-            "scale_mode": "nvfp4",
-            "layout": "output_input"
-        }))
-        .unwrap();
-        let error = match parse_spec::<Cpu>(&spec) {
-            Ok(_) => panic!("NVFP4 runtime spec was accepted"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("NVFP4 runtime storage is not supported"));
+    fn accepts_scale_formats_independently_of_group_size() {
+        use crate::backends::common::microfloat::MicrofloatScaleFormat;
+
+        for (scale_mode, scale_format) in
+            [("mxfp4", MicrofloatScaleFormat::E8m0), ("nvfp4", MicrofloatScaleFormat::E4m3)]
+        {
+            for group_size in [16, 32] {
+                let spec: AnyWeightMatrixSpec = serde_json::from_value(json!({
+                    "type": "MicrofloatSpec",
+                    "bits": 4,
+                    "group_size": group_size,
+                    "scale_mode": scale_mode,
+                    "layout": "output_input"
+                }))
+                .unwrap();
+                let parsed = parse_spec::<Cpu>(&spec).expect("supported scale-format/group-size combination");
+                let info = parsed.microfloat.expect("microfloat info");
+                assert_eq!(info.scale_format, scale_format);
+                assert_eq!(info.group_size, group_size);
+            }
+        }
     }
 }

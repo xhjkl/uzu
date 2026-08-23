@@ -18,7 +18,7 @@ use crate::{
                     MatmulRouting,
                 },
             },
-            microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
+            microfloat::{MicrofloatLayout, MicrofloatMetadata, MicrofloatScaleFormat},
         },
         metal::{Metal, MetalContext},
     },
@@ -88,7 +88,7 @@ fn bench_shape(
     let outer_scales =
         alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(1.0); expert_count as usize]);
     let microfloat_metadata =
-        MicrofloatMetadata::new(MicrofloatFormat::Mxfp4, 4, 32, MicrofloatLayout::OutputInput, expert_count, n, k)
+        MicrofloatMetadata::new(MicrofloatScaleFormat::E8m0, 4, 32, MicrofloatLayout::OutputInput, expert_count, n, k)
             .unwrap();
     let route_token_ids: Vec<u32> = (0..route_count).map(|route| route / routes_per_token).collect();
     let route_token_ids = alloc_allocation_with_data::<Metal, u32>(context, &route_token_ids);

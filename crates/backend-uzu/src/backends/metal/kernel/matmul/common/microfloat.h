@@ -22,8 +22,29 @@ METAL_FUNC float decode_e8m0(uint exponent) {
   return as_type<float>(exponent << 23u);
 }
 
-METAL_FUNC float decode_mxfp4(uint code, uint exponent, float outer_scale) {
-  return decode_e2m1(code) * decode_e8m0(exponent) * outer_scale;
+METAL_FUNC float decode_e4m3(uint bits) {
+  const uint sign = (bits & 0x80u) << 24u;
+  const uint exponent = (bits >> 3u) & 0xfu;
+  const uint mantissa = bits & 0x7u;
+  if (exponent == 0u) {
+    if (mantissa == 0u) {
+      return as_type<float>(sign);
+    }
+    const float value = float(mantissa) / 512.0f;
+    return as_type<float>(sign | as_type<uint>(value));
+  }
+  if (exponent == 15u && mantissa == 7u) {
+    return as_type<float>(sign | 0x7fc00000u);
+  }
+  return as_type<float>(sign | ((exponent + 120u) << 23u) | (mantissa << 20u));
+}
+
+template <bool SCALE_E4M3>
+METAL_FUNC float decode_group_scale(uint scale) {
+  if constexpr (SCALE_E4M3) {
+    return decode_e4m3(scale);
+  }
+  return decode_e8m0(scale);
 }
 
 } // namespace gemm

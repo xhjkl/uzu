@@ -6,6 +6,7 @@ use crate::{
             Buffer, BufferArg, Encoder,
             gpu_types::gemm::GemmDTransform,
             kernel::matmul::{MatmulA, MatmulArguments, MatmulB, MatmulError},
+            microfloat::MicrofloatScaleFormat,
         },
         metal::{
             Metal,
@@ -49,6 +50,7 @@ struct RoutedGemmSpecialization {
     output_transform: GemmDTransform,
     expert_bias: bool,
     microfloat_group_size: Option<u32>,
+    microfloat_scale_format: Option<MicrofloatScaleFormat>,
     expert_routed: bool,
 }
 
@@ -101,6 +103,7 @@ impl RoutedGemmDispatch {
                     self.output_data_type,
                     specialization.microfloat_group_size.is_some(),
                     specialization.microfloat_group_size.unwrap_or(0),
+                    specialization.microfloat_scale_format == Some(MicrofloatScaleFormat::E4m3),
                     specialization.expert_routed,
                     specialization.output_transform,
                     specialization.expert_bias,
@@ -146,11 +149,12 @@ impl RoutedGemmDispatch {
                 reason: "prepared int8 activations are not supported",
             });
         };
-        let (weights, scales, outer_scales, microfloat_group_size): (
+        let (weights, scales, outer_scales, microfloat_group_size, microfloat_scale_format): (
             RoutedBufferSlice<'b>,
             Option<RoutedBufferSlice<'b>>,
             Option<RoutedBufferSlice<'b>>,
             Option<u32>,
+            Option<MicrofloatScaleFormat>,
         ) = match arguments.b {
             MatmulB::FullPrecision {
                 b,
@@ -161,7 +165,7 @@ impl RoutedGemmDispatch {
                         reason: "dense grouped execution is reserved for microfloat weights",
                     });
                 }
-                (RoutedBufferSlice::from_arg(b), None, None, None)
+                (RoutedBufferSlice::from_arg(b), None, None, None, None)
             },
             MatmulB::Microfloat {
                 codes,
@@ -173,6 +177,7 @@ impl RoutedGemmDispatch {
                 Some(RoutedBufferSlice::from_arg(scales)),
                 Some(RoutedBufferSlice::from_arg(outer_scales)),
                 Some(metadata.group_size()),
+                Some(metadata.scale_format()),
             ),
             _ => {
                 return Err(MatmulError::UnsupportedRouting {
@@ -226,6 +231,7 @@ impl RoutedGemmDispatch {
             output_transform,
             expert_bias: arguments.d_transform.per_matrix_bias.is_some(),
             microfloat_group_size,
+            microfloat_scale_format,
             expert_routed: routes.is_some(),
         };
         let pipeline = self.get_or_create(encoder.context(), specialization)?;

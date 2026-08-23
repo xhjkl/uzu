@@ -5,7 +5,7 @@ use crate::{
         Allocation, Backend,
         gpu_types::{QuantizationMethod, QuantizationMode},
         kernel::matmul::MatmulB,
-        microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
+        microfloat::{MicrofloatLayout, MicrofloatMetadata, MicrofloatScaleFormat},
     },
     config::weight_matrix::{
         AnyWeightMatrixSpec, Layout,
@@ -32,7 +32,7 @@ pub struct QuantizationInfo {
 
 #[derive(Clone, Copy)]
 pub struct MicrofloatInfo {
-    pub format: MicrofloatFormat,
+    pub scale_format: MicrofloatScaleFormat,
     pub bits: u32,
     pub group_size: u32,
 }
@@ -69,13 +69,9 @@ pub fn parse_spec<B: Backend>(spec: &AnyWeightMatrixSpec) -> Result<ParsedWeight
             layout,
             ..
         }) => {
-            let format = match scale_mode {
-                MicrofloatScaleMode::Mxfp4 => MicrofloatFormat::Mxfp4,
-                MicrofloatScaleMode::Nvfp4 => {
-                    return Err(WeightMatrixError::UnsupportedConfiguration(
-                        "NVFP4 runtime storage is not supported".into(),
-                    ));
-                },
+            let scale_format = match scale_mode {
+                MicrofloatScaleMode::Mxfp4 => MicrofloatScaleFormat::E8m0,
+                MicrofloatScaleMode::Nvfp4 => MicrofloatScaleFormat::E4m3,
             };
             let group_size = u32::try_from(*group_size).map_err(|_| {
                 WeightMatrixError::UnsupportedConfiguration(format!("microfloat group size {group_size} exceeds u32"))
@@ -84,13 +80,13 @@ pub fn parse_spec<B: Backend>(spec: &AnyWeightMatrixSpec) -> Result<ParsedWeight
                 Layout::OutputInput => MicrofloatLayout::OutputInput,
                 Layout::InputOutput => MicrofloatLayout::InputOutput,
             };
-            MicrofloatMetadata::new(format, *bits, group_size, runtime_layout, 1, 1, group_size)
+            MicrofloatMetadata::new(scale_format, *bits, group_size, runtime_layout, 1, 1, group_size)
                 .map_err(|error| WeightMatrixError::UnsupportedConfiguration(error.to_string()))?;
             (
                 layout.clone(),
                 None,
                 Some(MicrofloatInfo {
-                    format,
+                    scale_format,
                     bits: *bits,
                     group_size,
                 }),
@@ -218,7 +214,7 @@ impl<B: Backend> WeightMatrix<B> {
                 Layout::InputOutput => MicrofloatLayout::InputOutput,
             };
             let metadata = MicrofloatMetadata::new(
-                info.format,
+                info.scale_format,
                 info.bits,
                 info.group_size,
                 runtime_layout,

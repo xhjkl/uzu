@@ -15,6 +15,7 @@ use crate::{
             kernel::matmul::{
                 ExpertInput, GateActMulDOps, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape,
             },
+            microfloat::MicrofloatScaleFormat,
         },
         metal::{Metal, context::MetalContext, device_profile::DeviceProfile, kernel::GemvMetalKernel},
     },
@@ -31,7 +32,7 @@ pub(crate) struct GemvSpecialization {
     k_split: u32,
     results_per_simdgroup: u32,
     num_simdgroups: u32,
-    microfloat: bool,
+    scale_format: Option<MicrofloatScaleFormat>,
     gathered: bool,
     expert_routed: bool,
     expert_bias: bool,
@@ -51,7 +52,8 @@ impl GemvSpecialization {
             return None;
         }
         let is_quant = shape.is_integer_quantized();
-        let microfloat = shape.b_microfloat.is_some();
+        let scale_format = shape.b_microfloat.map(|metadata| metadata.scale_format());
+        let microfloat = scale_format.is_some();
         let bad_leading_dimension = if is_quant {
             shape.b_leading_dimension.is_some()
         } else {
@@ -117,7 +119,7 @@ impl GemvSpecialization {
             k_split: tile.k_split,
             results_per_simdgroup: tile.results_per_simdgroup,
             num_simdgroups: tile.num_simdgroups,
-            microfloat,
+            scale_format,
             gathered: shape.sparse_readout,
             expert_routed: shape.expert_routed,
             expert_bias: shape.expert_bias,
@@ -257,6 +259,8 @@ impl GemvDispatch {
         match self.pipelines.entry(specialization) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
+                let microfloat = specialization.scale_format.is_some();
+                let scale_e4m3 = specialization.scale_format == Some(MicrofloatScaleFormat::E4m3);
                 let kernel = GemvMetalKernel::new(
                     context,
                     self.input_data_type,
@@ -269,7 +273,8 @@ impl GemvDispatch {
                     specialization.input_aligned,
                     specialization.results_per_simdgroup,
                     specialization.num_simdgroups,
-                    specialization.microfloat,
+                    microfloat,
+                    scale_e4m3,
                     specialization.output_transform,
                     specialization.gathered,
                     specialization.expert_routed,

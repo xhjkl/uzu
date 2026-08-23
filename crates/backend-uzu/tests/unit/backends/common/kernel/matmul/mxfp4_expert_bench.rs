@@ -23,7 +23,7 @@ use crate::{
                     MatmulRouting,
                 },
             },
-            microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
+            microfloat::{MicrofloatLayout, MicrofloatMetadata, MicrofloatScaleFormat},
         },
         metal::{DEFAULT_GEMV_MAX_BATCH, Metal, MetalContext},
     },
@@ -253,7 +253,7 @@ fn bench_mxfp4_expert_projection(
     let outer_scales = alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(1.0); experts]);
     let biases = alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(0.0); experts * n]);
     let metadata = MicrofloatMetadata::new(
-        MicrofloatFormat::Mxfp4,
+        MicrofloatScaleFormat::E8m0,
         4,
         shape.group_size,
         MicrofloatLayout::OutputInput,
@@ -412,7 +412,7 @@ fn bench_mxfp4_expert_decode_production(c: &mut Criterion) {
         let outer_scales = alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(1.0); experts]);
         let biases = alloc_allocation_with_data::<Metal, bf16>(context, &vec![bf16::from_f32(0.0); experts * n]);
         let metadata = MicrofloatMetadata::new(
-            MicrofloatFormat::Mxfp4,
+            MicrofloatScaleFormat::E8m0,
             4,
             W13.group_size,
             MicrofloatLayout::OutputInput,

@@ -1,9 +1,10 @@
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MicrofloatFormat {
-    Mxfp4,
-    Nvfp4,
+/// Encoding of the one-byte scale applied to each packed E2M1 group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MicrofloatScaleFormat {
+    E8m0,
+    E4m3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,18 +15,10 @@ pub enum MicrofloatLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MicrofloatError {
-    #[error("unsupported microfloat format: {0:?}")]
-    UnsupportedFormat(MicrofloatFormat),
-    #[error("unsupported {format:?} bit width: {bits}")]
-    UnsupportedBits {
-        format: MicrofloatFormat,
-        bits: u32,
-    },
-    #[error("unsupported {format:?} group size: {group_size}")]
-    UnsupportedGroupSize {
-        format: MicrofloatFormat,
-        group_size: u32,
-    },
+    #[error("unsupported microfloat bit width: {0}")]
+    UnsupportedBits(u32),
+    #[error("unsupported microfloat group size: {0}")]
+    UnsupportedGroupSize(u32),
     #[error("unsupported microfloat matrix layout: {0:?}")]
     UnsupportedLayout(MicrofloatLayout),
     #[error("microfloat matrix count, rows, and columns must be nonzero")]
@@ -39,13 +32,14 @@ pub enum MicrofloatError {
     SizeOverflow,
 }
 
-/// Packed E2M1 values with per-group E8M0 scales.
+/// Packed E2M1 values with per-group scales.
 ///
-/// Group 32 is the OCP MXFP4 block size. Group 16 is the converter-defined
-/// GPT-OSS layout, which retains the same E2M1/E8M0 encoding.
+/// Scale encoding and group size are independent storage dimensions. OCP
+/// MXFP4 is group-32 E8M0 and NVFP4 is group-16 E4M3, while converters may
+/// intentionally emit combinations such as group-16 E8M0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MicrofloatMetadata {
-    format: MicrofloatFormat,
+    scale_format: MicrofloatScaleFormat,
     group_size: u32,
     layout: MicrofloatLayout,
     matrix_count: u32,
@@ -55,7 +49,7 @@ pub struct MicrofloatMetadata {
 
 impl MicrofloatMetadata {
     pub fn new(
-        format: MicrofloatFormat,
+        scale_format: MicrofloatScaleFormat,
         bits: u32,
         group_size: u32,
         layout: MicrofloatLayout,
@@ -63,20 +57,11 @@ impl MicrofloatMetadata {
         rows: u32,
         columns: u32,
     ) -> Result<Self, MicrofloatError> {
-        if format != MicrofloatFormat::Mxfp4 {
-            return Err(MicrofloatError::UnsupportedFormat(format));
-        }
         if bits != 4 {
-            return Err(MicrofloatError::UnsupportedBits {
-                format,
-                bits,
-            });
+            return Err(MicrofloatError::UnsupportedBits(bits));
         }
         if !matches!(group_size, 16 | 32) {
-            return Err(MicrofloatError::UnsupportedGroupSize {
-                format,
-                group_size,
-            });
+            return Err(MicrofloatError::UnsupportedGroupSize(group_size));
         }
         if layout != MicrofloatLayout::OutputInput {
             return Err(MicrofloatError::UnsupportedLayout(layout));
@@ -91,7 +76,7 @@ impl MicrofloatMetadata {
             });
         }
         let metadata = Self {
-            format,
+            scale_format,
             group_size,
             layout,
             matrix_count,
@@ -103,8 +88,8 @@ impl MicrofloatMetadata {
         Ok(metadata)
     }
 
-    pub fn format(self) -> MicrofloatFormat {
-        self.format
+    pub fn scale_format(self) -> MicrofloatScaleFormat {
+        self.scale_format
     }
 
     pub fn bits(self) -> u32 {
@@ -187,13 +172,38 @@ pub fn decode_e8m0(exponent: u8) -> f32 {
     }
 }
 
+/// NVIDIA E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. No infinities;
+/// exponent 15 with mantissa 7 is NaN, and the finite maximum is 448.
 #[inline]
-pub fn decode_mxfp4(
-    code: u8,
-    exponent: u8,
-    outer_scale: f32,
-) -> f32 {
-    decode_e2m1(code) * decode_e8m0(exponent) * outer_scale
+pub fn decode_e4m3(bits: u8) -> f32 {
+    let sign = u32::from(bits >> 7) << 31;
+    let exponent = (bits >> 3) & 0x0f;
+    let mantissa = bits & 0x07;
+    if exponent == 0 {
+        if mantissa == 0 {
+            return f32::from_bits(sign);
+        }
+        let value = f32::from(mantissa) / 512.0;
+        return f32::from_bits(sign | value.to_bits());
+    }
+    if exponent == 15 && mantissa == 7 {
+        return f32::from_bits(sign | 0x7fc0_0000);
+    }
+    f32::from_bits(sign | ((u32::from(exponent) + 120) << 23) | (u32::from(mantissa) << 20))
+}
+
+impl MicrofloatScaleFormat {
+    /// Decode one stored group scale.
+    #[inline]
+    pub fn decode(
+        self,
+        scale: u8,
+    ) -> f32 {
+        match self {
+            Self::E8m0 => decode_e8m0(scale),
+            Self::E4m3 => decode_e4m3(scale),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,10 +225,24 @@ mod tests {
     }
 
     #[uzu_test]
-    fn validates_supported_mxfp4_layouts() {
+    fn decodes_e4m3_edges() {
+        assert_eq!(decode_e4m3(0x00).to_bits(), 0.0f32.to_bits());
+        assert_eq!(decode_e4m3(0x80).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(decode_e4m3(0x01), 1.0 / 512.0);
+        assert_eq!(decode_e4m3(0x38), 1.0);
+        assert_eq!(decode_e4m3(0x3c), 1.5);
+        assert_eq!(decode_e4m3(0x40), 2.0);
+        assert_eq!(decode_e4m3(0xb8), -1.0);
+        assert_eq!(decode_e4m3(0x7e), 448.0);
+        assert!(decode_e4m3(0x7f).is_nan());
+        assert_ne!(MicrofloatScaleFormat::E4m3.decode(0x38), MicrofloatScaleFormat::E8m0.decode(0x38));
+    }
+
+    #[uzu_test]
+    fn validates_supported_microfloat_layouts() {
         for group_size in [16, 32] {
             let metadata = MicrofloatMetadata::new(
-                MicrofloatFormat::Mxfp4,
+                MicrofloatScaleFormat::E8m0,
                 4,
                 group_size,
                 MicrofloatLayout::OutputInput,
@@ -230,9 +254,19 @@ mod tests {
             assert_eq!(metadata.required_code_bytes(), 96);
             assert_eq!(metadata.required_scale_bytes(), 2 * 3 * 32 / group_size as usize);
         }
-        assert!(matches!(
-            MicrofloatMetadata::new(MicrofloatFormat::Nvfp4, 4, 16, MicrofloatLayout::OutputInput, 1, 1, 16),
-            Err(MicrofloatError::UnsupportedFormat(MicrofloatFormat::Nvfp4))
-        ));
+        for group_size in [16, 32] {
+            let e4m3 = MicrofloatMetadata::new(
+                MicrofloatScaleFormat::E4m3,
+                4,
+                group_size,
+                MicrofloatLayout::OutputInput,
+                2,
+                3,
+                32,
+            )
+            .expect("supported E4M3-scaled metadata");
+            assert_eq!(e4m3.required_code_bytes(), 96);
+            assert_eq!(e4m3.required_scale_bytes(), 2 * 3 * 32 / group_size as usize);
+        }
     }
 }

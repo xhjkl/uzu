@@ -20,14 +20,16 @@ METAL_FUNC float4 load_unaligned_float4(const device T* values) {
   return float4(float(values[0]), float(values[1]), float(values[2]), float(values[3]));
 }
 
-template <typename AT, typename BT, typename DT, bool MICROFLOAT, uint GROUP_SIZE, bool EXPERT_ROUTED>
+template <typename AT, typename BT, typename DT, bool MICROFLOAT, uint GROUP_SIZE, bool SCALE_E4M3, bool EXPERT_ROUTED>
 VARIANTS(AT, half, bfloat, float)
 VARIANTS(BT, half, bfloat, float)
 VARIANTS(DT, half, bfloat, float)
 VARIANTS(MICROFLOAT, false, true)
 VARIANTS(GROUP_SIZE, 0, 16, 32)
+VARIANTS(SCALE_E4M3, false, true)
 VARIANTS(EXPERT_ROUTED, false, true)
 CONSTRAINT(MICROFLOAT == (GROUP_SIZE != 0))
+CONSTRAINT(MICROFLOAT || !SCALE_E4M3)
 CONSTRAINT(BT != "float" || (AT == "float" && DT == "float"))
 CONSTRAINT(EXPERT_ROUTED || MICROFLOAT)
 KERNEL(RoutedGemm)(
@@ -131,8 +133,8 @@ KERNEL(RoutedGemm)(
         if constexpr (MICROFLOAT) {
           const device uchar* codes = b + bank_row * (k / 2) + inner / 2;
           const ushort packed = *reinterpret_cast<const device ushort*>(codes);
-          const uint exponent = scales[bank_row * (k / GROUP_SIZE) + inner / GROUP_SIZE];
-          const float scale = decode_e8m0(exponent) * global_scale;
+          const uint group_scale = scales[bank_row * (k / GROUP_SIZE) + inner / GROUP_SIZE];
+          const float scale = decode_group_scale<SCALE_E4M3>(group_scale) * global_scale;
           weight = scale * float4(
               decode_e2m1(packed & 0x0fu),
               decode_e2m1((packed >> 4u) & 0x0fu),

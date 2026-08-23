@@ -19,7 +19,8 @@ template <
     bool INPUT_ALIGNED,
     uint RESULTS_PER_SIMDGROUP,
     uint NUM_SIMDGROUPS,
-    bool MICROFLOAT>
+    bool MICROFLOAT,
+    bool SCALE_E4M3>
 VARIANTS(AT, half, bfloat, float)
 VARIANTS(BT, half, bfloat, float)
 VARIANTS(DT, half, bfloat, float)
@@ -37,10 +38,12 @@ VARIANTS(INPUT_ALIGNED, false, true)
 VARIANTS(RESULTS_PER_SIMDGROUP, 1, 2, 4, 8)
 VARIANTS(NUM_SIMDGROUPS, 2, 4, 8)
 VARIANTS(MICROFLOAT, false, true)
+VARIANTS(SCALE_E4M3, false, true)
 CONSTRAINT(MICROFLOAT || (B_PROLOGUE == GemmBPrologueKind::FullPrecision) == (BITS == 0))
 CONSTRAINT(MICROFLOAT || (BITS == 0) == (GROUP_SIZE == 0))
 CONSTRAINT(!MICROFLOAT || (B_PROLOGUE == GemmBPrologueKind::FullPrecision && BITS == 4))
 CONSTRAINT(!MICROFLOAT || GROUP_SIZE == 16 || GROUP_SIZE == 32)
+CONSTRAINT(!SCALE_E4M3 || MICROFLOAT)
 CONSTRAINT(B_PROLOGUE == GemmBPrologueKind::FullPrecision || BT != "float")
 CONSTRAINT(B_PROLOGUE == GemmBPrologueKind::FullPrecision || K_SPLIT == 1)
 CONSTRAINT(K_SPLIT <= NUM_SIMDGROUPS)
@@ -120,7 +123,7 @@ KERNEL(Gemv)(
 
   d += size_t(batch_idx) * size_t(out_vec_size) + size_t(tile.out_row);
 
-  BSource<BT, AT, U, B_PROLOGUE, GROUP_SIZE, BITS, K_SPLIT, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED, MICROFLOAT>::
+  BSource<BT, AT, U, B_PROLOGUE, GROUP_SIZE, BITS, K_SPLIT, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED, MICROFLOAT, SCALE_E4M3>::
       accumulate(
           result,
           b,

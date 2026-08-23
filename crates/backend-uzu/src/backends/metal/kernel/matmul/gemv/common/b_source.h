@@ -18,7 +18,8 @@ template <
     uint K_SPLIT,
     uint RESULTS_PER_SIMDGROUP,
     bool INPUT_ALIGNED,
-    bool MICROFLOAT>
+    bool MICROFLOAT,
+    bool SCALE_E4M3>
 struct BSource {
   static METAL_FUNC void accumulate(
       thread U (&result)[RESULTS_PER_SIMDGROUP],
@@ -41,7 +42,7 @@ struct BSource {
       const bool signed_codes
   ) {
     if constexpr (MICROFLOAT) {
-      MicrofloatBSource<BT, AT, U, GROUP_SIZE, K_SPLIT, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED>::accumulate(
+      MicrofloatBSource<BT, AT, U, GROUP_SIZE, K_SPLIT, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED, SCALE_E4M3>::accumulate(
           result,
           b,
           reinterpret_cast<const device uint8_t*>(scales),
