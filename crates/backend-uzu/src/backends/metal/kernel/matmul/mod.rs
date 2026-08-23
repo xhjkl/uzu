@@ -2,16 +2,11 @@ use std::mem::size_of;
 
 pub mod gemm;
 pub mod gemv;
-mod routed;
 
 pub use self::gemm::GemmKernel;
 use self::{
     gemm::{GemmPlan, GemmProblem},
-    gemv::{
-        DEFAULT_GEMV_MAX_BATCH, GemvDispatch, GemvSpecialization, Mxfp4ExpertDecodeGemvDispatch,
-        Mxfp4ExpertDecodeGemvSpec,
-    },
-    routed::RowTiledGemm,
+    gemv::{DEFAULT_GEMV_MAX_BATCH, GemvDispatch, GemvPlan},
 };
 use crate::{
     backends::{
@@ -33,8 +28,6 @@ use crate::{
 
 pub struct MatmulMetalKernel {
     gemv: GemvDispatch,
-    row_tiled_gemm: RowTiledGemm,
-    mxfp4_expert_decode: Mxfp4ExpertDecodeGemvDispatch,
     pub gemm: GemmKernel,
     weights_data_type: DataType,
     input_data_type: DataType,
@@ -44,8 +37,7 @@ pub struct MatmulMetalKernel {
 }
 
 enum MatmulDispatch {
-    Mxfp4ExpertDecodeGemv(Mxfp4ExpertDecodeGemvSpec),
-    Gemv(GemvSpecialization),
+    Gemv(GemvPlan),
     Gemm(GemmPlan),
 }
 
@@ -96,22 +88,13 @@ impl MatmulMetalKernel {
         gate_act: Option<GateActMulDOps>,
         context: &MetalContext,
     ) -> MatmulDispatch {
-        if let Some(spec) = Mxfp4ExpertDecodeGemvSpec::select(
+        let gemv = GemvDispatch::select(
             shape,
             self.weights_data_type,
             self.input_data_type,
             self.output_data_type,
             ab_scale,
             gate_act,
-            context.device_profile(),
-        ) {
-            return MatmulDispatch::Mxfp4ExpertDecodeGemv(spec);
-        }
-        let gemv = GemvSpecialization::select_shape(
-            shape,
-            self.weights_data_type,
-            self.input_data_type,
-            self.output_data_type,
             context.device_profile(),
             self.gemv_max_batch,
         );
@@ -158,14 +141,9 @@ impl MatmulKernel for MatmulMetalKernel {
 
         let gemm = GemmKernel::new(context, weights_data_type, input_data_type, output_data_type)?;
         let gemv = GemvDispatch::new(weights_data_type, input_data_type, output_data_type);
-        let row_tiled_gemm = RowTiledGemm::new(context, weights_data_type, input_data_type, output_data_type)?;
-        let mxfp4_expert_decode =
-            Mxfp4ExpertDecodeGemvDispatch::new(weights_data_type, input_data_type, output_data_type);
 
         Ok(Self {
             gemv,
-            row_tiled_gemm,
-            mxfp4_expert_decode,
             gemm,
             weights_data_type,
             input_data_type,
@@ -215,10 +193,7 @@ impl MatmulKernel for MatmulMetalKernel {
         bf16_shape: &MatmulShape,
         context: &MetalContext,
     ) -> ActivationFormat {
-        if matches!(
-            self.select_dispatch(bf16_shape, 1.0, None, context),
-            MatmulDispatch::Gemv(_) | MatmulDispatch::Mxfp4ExpertDecodeGemv(_)
-        ) {
+        if matches!(self.select_dispatch(bf16_shape, 1.0, None, context), MatmulDispatch::Gemv(_)) {
             return ActivationFormat::Bf16;
         }
 
@@ -240,20 +215,13 @@ impl MatmulKernel for MatmulMetalKernel {
             d_transform: GemmDTransform::GATE_ACT_MUL,
             ..*shape
         };
-        Mxfp4ExpertDecodeGemvSpec::select(
+        GemvDispatch::supports_fused_gate_act(
             &probed_shape,
             self.weights_data_type,
             self.input_data_type,
             self.output_data_type,
-            1.0,
-            Some(GateActMulDOps {
-                activation_alpha: None,
-                gate_clipping: None,
-                value_clipping: None,
-            }),
             self.device_profile,
         )
-        .is_some()
     }
 
     fn encode<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
@@ -394,19 +362,7 @@ impl MatmulKernel for MatmulMetalKernel {
             arguments.d_transform.gate_act,
             encoder.context(),
         ) {
-            MatmulDispatch::Mxfp4ExpertDecodeGemv(spec) => {
-                return self.mxfp4_expert_decode.encode(arguments, spec, encoder).map_err(MetalError::from);
-            },
-            MatmulDispatch::Gemv(gemv) => {
-                if arguments.d_transform.gate_act.is_some() {
-                    return Err(MatmulError::<Metal>::UnsupportedDOp {
-                        bit: GemmDTransform::GATE_ACT_MUL,
-                        path: "MetalMatmul",
-                    }
-                    .into());
-                }
-                return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from);
-            },
+            MatmulDispatch::Gemv(gemv) => return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from),
             MatmulDispatch::Gemm(plan) => plan,
         };
 
@@ -427,9 +383,6 @@ impl MatmulKernel for MatmulMetalKernel {
                 )
                 .into(),
             ));
-        }
-        if arguments.routing.expert_routes().is_some() || shape.b_microfloat.is_some() {
-            return self.row_tiled_gemm.encode(arguments, encoder).map_err(MetalError::from);
         }
         self.gemm.encode_plan(arguments, plan, encoder)
     }

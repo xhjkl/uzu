@@ -1,4 +1,4 @@
-use proc_macros::uzu_config;
+use backend_uzu_macros::uzu_config;
 
 use crate::config::weight_matrix::Layout;
 
@@ -19,7 +19,7 @@ pub struct MicrofloatSpec {
 
 #[cfg(test)]
 mod tests {
-    use proc_macros::uzu_test;
+    use backend_uzu_macros::uzu_test;
     use serde_json::json;
 
     use super::*;

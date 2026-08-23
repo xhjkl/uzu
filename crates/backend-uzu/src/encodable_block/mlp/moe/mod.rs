@@ -3,6 +3,8 @@
 mod experts;
 mod router;
 
+use std::num::NonZeroU32;
+
 use experts::MoeExperts;
 use router::MoeRouter;
 use thiserror::Error;
@@ -21,8 +23,8 @@ use crate::{
     },
     data_type::DataType,
     encodable_block::{
+        linear::{LinearMatmul, LinearMatmulError},
         mlp::Mlp,
-        weight_matrix::{WeightMatrix, WeightMatrixError},
     },
     parameters::{ParameterLoaderError, ParameterTree},
 };
@@ -53,8 +55,8 @@ pub enum MoeBlockError<B: Backend> {
     BackendError(#[source] B::Error),
     #[error("Parameter loader error: {0}")]
     ParameterLoaderError(#[from] ParameterLoaderError<B>),
-    #[error("Expert weight loading error: {0}")]
-    WeightMatrixError(#[from] WeightMatrixError<B>),
+    #[error("Expert linear loading error: {0}")]
+    ExpertLinearError(#[from] LinearMatmulError<B>),
     #[error("MoE model_dim must be nonzero, divisible by 4, and within the fused router capacity")]
     InvalidModelDim,
     #[error("MoE num_routed_experts must be nonzero and within the fused router capacity")]
@@ -153,36 +155,35 @@ impl<B: Backend> MoeBlock<B> {
         let experts_tree = parameter_tree.subtree("experts");
         let up_tree = experts_tree.subtree("up_projection");
         let down_tree = experts_tree.subtree("down_projection");
+        let expert_count = NonZeroU32::new(moe_config.num_routed_experts).expect("expert count was validated");
         let up_weights_tree = up_tree.subtree("weights");
         let up_spec = Self::expert_spec(&up_weights_tree)?;
-        let up_projection = WeightMatrix::load_bank(
-            &up_weights_tree,
+        let up_projection = LinearMatmul::load_bank(
+            context,
             up_spec,
-            Layout::OutputInput,
-            moe_config.num_routed_experts,
-            fused_hidden_dim,
             model_dim,
+            fused_hidden_dim,
+            expert_count,
             data_type,
+            data_type,
+            DataType::F32,
+            &up_weights_tree,
+            Some(&up_tree),
         )?;
         let down_weights_tree = down_tree.subtree("weights");
         let down_spec = Self::expert_spec(&down_weights_tree)?;
-        let down_projection = WeightMatrix::load_bank(
-            &down_weights_tree,
+        let down_projection = LinearMatmul::load_bank(
+            context,
             down_spec,
-            Layout::OutputInput,
-            moe_config.num_routed_experts,
-            model_dim,
             moe_config.expert_hidden_dim,
+            model_dim,
+            expert_count,
             data_type,
+            DataType::F32,
+            data_type,
+            &down_weights_tree,
+            Some(&down_tree),
         )?;
-        let up_biases = up_tree
-            .leaf("biases")?
-            .validate(&[moe_config.num_routed_experts, fused_hidden_dim], data_type)?
-            .read_allocation()?;
-        let down_biases = down_tree
-            .leaf("biases")?
-            .validate(&[moe_config.num_routed_experts, model_dim], data_type)?
-            .read_allocation()?;
 
         let router = MoeRouter::new(
             context,
@@ -202,11 +203,8 @@ impl<B: Backend> MoeBlock<B> {
             context,
             up_projection,
             down_projection,
-            up_biases,
-            down_biases,
             model_dim,
             moe_config.expert_hidden_dim,
-            fused_hidden_dim,
             moe_config.num_routed_experts,
             moe_config.expert_config.activation.clone(),
             moe_config.expert_config.gate_clipping,

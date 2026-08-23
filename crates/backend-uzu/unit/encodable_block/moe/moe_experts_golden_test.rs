@@ -8,12 +8,9 @@ use super::super::{experts::MoeExperts, router::MoeRoutes};
 use crate::{
     ClippingBounds,
     backends::common::{Backend, Context, Encoder},
-    config::{
-        activation::AnyActivation,
-        weight_matrix::{AnyWeightMatrixSpec, Layout},
-    },
+    config::{activation::AnyActivation, weight_matrix::AnyWeightMatrixSpec},
     data_type::DataType,
-    encodable_block::weight_matrix::WeightMatrix,
+    encodable_block::linear::LinearMatmul,
     parameters::ParameterLoader,
     tests::{
         assert::assert_eq_float,
@@ -80,8 +77,8 @@ fn parameter_file() -> NamedTempFile {
     let mut payload = Vec::new();
     tensor(&mut header, &mut payload, "up.weights", &[EXPERTS, FUSED_HIDDEN_DIM, MODEL_DIM], &UP_WEIGHTS);
     tensor(&mut header, &mut payload, "down.weights", &[EXPERTS, MODEL_DIM, HIDDEN_DIM], &DOWN_WEIGHTS);
-    tensor(&mut header, &mut payload, "up_biases", &[EXPERTS, FUSED_HIDDEN_DIM], &UP_BIASES);
-    tensor(&mut header, &mut payload, "down_biases", &[EXPERTS, MODEL_DIM], &DOWN_BIASES);
+    tensor(&mut header, &mut payload, "up.biases", &[EXPERTS, FUSED_HIDDEN_DIM], &UP_BIASES);
+    tensor(&mut header, &mut payload, "down.biases", &[EXPERTS, MODEL_DIM], &DOWN_BIASES);
 
     let mut header = serde_json::to_vec(&Value::Object(header)).expect("serialize header");
     header.extend(std::iter::repeat_n(b' ', (8 - header.len() % 8) % 8));
@@ -132,51 +129,42 @@ fn run<B: Backend>() -> Vec<f32> {
     let spec: AnyWeightMatrixSpec =
         serde_json::from_value(json!({"type": "FullPrecisionSpec", "layout": "output_input"}))
             .expect("full-precision spec");
-    let up = WeightMatrix::load_bank(
-        &tree.subtree("up"),
+    let up_tree = tree.subtree("up");
+    let up = LinearMatmul::load_bank(
+        context.as_ref(),
         spec.clone(),
-        Layout::OutputInput,
-        EXPERTS as u32,
-        FUSED_HIDDEN_DIM as u32,
         MODEL_DIM as u32,
+        FUSED_HIDDEN_DIM as u32,
+        NonZeroU32::new(EXPERTS as u32).unwrap(),
         DataType::F32,
+        DataType::F32,
+        DataType::F32,
+        &up_tree,
+        Some(&up_tree),
     )
     .expect("load up projection");
-    let down = WeightMatrix::load_bank(
-        &tree.subtree("down"),
+    let down_tree = tree.subtree("down");
+    let down = LinearMatmul::load_bank(
+        context.as_ref(),
         spec,
-        Layout::OutputInput,
-        EXPERTS as u32,
-        MODEL_DIM as u32,
         HIDDEN_DIM as u32,
+        MODEL_DIM as u32,
+        NonZeroU32::new(EXPERTS as u32).unwrap(),
         DataType::F32,
+        DataType::F32,
+        DataType::F32,
+        &down_tree,
+        Some(&down_tree),
     )
     .expect("load down projection");
-    let up_biases = tree
-        .leaf("up_biases")
-        .unwrap()
-        .validate(&[EXPERTS as u32, FUSED_HIDDEN_DIM as u32], DataType::F32)
-        .unwrap()
-        .read_allocation()
-        .unwrap();
-    let down_biases = tree
-        .leaf("down_biases")
-        .unwrap()
-        .validate(&[EXPERTS as u32, MODEL_DIM as u32], DataType::F32)
-        .unwrap()
-        .read_allocation()
-        .unwrap();
     let activation: AnyActivation =
         serde_json::from_value(json!({"type": "SiLU", "alpha": 1.0})).expect("SiLU activation");
     let experts = MoeExperts::new(
         context.as_ref(),
         up,
         down,
-        up_biases,
-        down_biases,
         MODEL_DIM as u32,
         HIDDEN_DIM as u32,
-        FUSED_HIDDEN_DIM as u32,
         EXPERTS as u32,
         activation,
         ClippingBounds::bounded(-1.5, 2.0),

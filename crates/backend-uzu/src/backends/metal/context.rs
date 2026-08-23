@@ -329,14 +329,12 @@ impl Context for MetalContext {
 
 #[cfg(test)]
 mod timeline_tests {
-    use proc_macros::uzu_test;
+    use backend_uzu_macros::uzu_test;
 
     use super::{MetalContext, TimelineState};
     use crate::{
         backends::common::{Context, Encoder, SparseBuffer},
-        tests::helpers::{
-            alloc_allocation, alloc_allocation_with_data, allocation_to_vec, sparse_buffer_create,
-        },
+        tests::helpers::{alloc_allocation, alloc_allocation_with_data, allocation_to_vec, sparse_buffer_create},
     };
 
     #[uzu_test]

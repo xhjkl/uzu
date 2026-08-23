@@ -9,7 +9,6 @@ use crate::{
         },
         metal::{
             Metal,
-            command_buffer::{MetalRoutePlan, MetalRoutePlanKey},
             context::MetalContext,
             kernel::{
                 ExpertRouteClearCountsMetalKernel, ExpertRouteCountMetalKernel, ExpertRoutePrefixMetalKernel,
@@ -46,27 +45,27 @@ impl<'a> BufferArg<'a, Metal> for RoutedBufferSlice<'a> {
 
 /// Pipeline identity for dense microfloat and backend-grouped expert GEMM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RowTiledGemmSpecialization {
+struct RoutedGemmSpecialization {
     output_transform: GemmDTransform,
     expert_bias: bool,
     microfloat_group_size: Option<u32>,
     expert_routed: bool,
 }
 
-/// Row-tiled GEMM arm selected after direct routes cross the GEMV threshold.
-pub(super) struct RowTiledGemm {
+/// Routed and microfloat schedule inside the shared GEMM family.
+pub(super) struct RoutedGemmDispatch {
     clear_counts: ExpertRouteClearCountsMetalKernel,
     count: ExpertRouteCountMetalKernel,
     prefix: ExpertRoutePrefixMetalKernel,
     scatter: ExpertRouteScatterMetalKernel,
     zero_invalid: ExpertRouteZeroInvalidMetalKernel,
-    pipelines: HashMap<RowTiledGemmSpecialization, RoutedGemmMetalKernel>,
+    pipelines: HashMap<RoutedGemmSpecialization, RoutedGemmMetalKernel>,
     weights_data_type: DataType,
     input_data_type: DataType,
     output_data_type: DataType,
 }
 
-impl RowTiledGemm {
+impl RoutedGemmDispatch {
     pub(super) fn new(
         context: &MetalContext,
         weights_data_type: DataType,
@@ -90,7 +89,7 @@ impl RowTiledGemm {
     fn get_or_create(
         &mut self,
         context: &MetalContext,
-        specialization: RowTiledGemmSpecialization,
+        specialization: RoutedGemmSpecialization,
     ) -> Result<&RoutedGemmMetalKernel, MatmulError<Metal>> {
         match self.pipelines.entry(specialization) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
@@ -119,20 +118,20 @@ impl RowTiledGemm {
     ) -> Result<(), MatmulError<Metal>> {
         if arguments.routing.sparse_readout_rows().is_some() {
             return Err(MatmulError::UnsupportedRouting {
-                path: "RowTiledGemm",
+                path: "RoutedGemm",
                 reason: "row-tiled GEMM does not support sparse readout rows",
             });
         }
         let output_transform = arguments.d_transform.mask();
         if output_transform.intersects(GemmDTransform::ACCUMULATE | GemmDTransform::RHT) {
             return Err(MatmulError::UnsupportedRouting {
-                path: "RowTiledGemm",
+                path: "RoutedGemm",
                 reason: "accumulation and RHT are not supported for grouped expert routes",
             });
         }
         if !arguments.b_transpose || arguments.b_leading_dimension.is_some() {
             return Err(MatmulError::UnsupportedRouting {
-                path: "RowTiledGemm",
+                path: "RoutedGemm",
                 reason: "grouped expert routes require contiguous output-input weights",
             });
         }
@@ -143,7 +142,7 @@ impl RowTiledGemm {
         } = arguments.a
         else {
             return Err(MatmulError::IncompatibleA {
-                path: "RowTiledGemm",
+                path: "RoutedGemm",
                 reason: "prepared int8 activations are not supported",
             });
         };
@@ -158,7 +157,7 @@ impl RowTiledGemm {
             } => {
                 if routes.is_none() {
                     return Err(MatmulError::UnsupportedRouting {
-                        path: "RowTiledGemm",
+                        path: "RoutedGemm",
                         reason: "dense grouped execution is reserved for microfloat weights",
                     });
                 }
@@ -177,7 +176,7 @@ impl RowTiledGemm {
             ),
             _ => {
                 return Err(MatmulError::UnsupportedRouting {
-                    path: "RowTiledGemm",
+                    path: "RoutedGemm",
                     reason: "grouped expert routes require full-precision or microfloat weights",
                 });
             },
@@ -185,48 +184,30 @@ impl RowTiledGemm {
 
         let expert_count = routes.map_or(1, |routes| routes.expert_count.get());
         let route_count = arguments.m;
-        let (route_plan_key, route_plan, cache_route_plan) = if let Some(routes) = routes {
-            let route_plan_key =
-                MetalRoutePlanKey::new(routes.identity, route_count, expert_count, routes.routes_per_token.get());
-            let route_plan = encoder.as_command_buffer_mut().take_route_plan(&route_plan_key);
-            let (route_plan, cache_route_plan) = match route_plan {
-                // W2 consumes the plan produced for W13. Do not reinsert it:
-                // the next layer has a distinct route identity.
-                Some(route_plan) => (route_plan, false),
-                None => {
-                    let mut offsets = encoder
-                        .allocate_scratch_for_shape(&[expert_count + 1], DataType::U32)
-                        .map_err(MatmulError::BackendError)?;
-                    let mut cursors = encoder
-                        .allocate_scratch_for_shape(&[expert_count], DataType::U32)
-                        .map_err(MatmulError::BackendError)?;
-                    let mut grouped_routes = encoder
-                        .allocate_scratch_for_shape(&[route_count], DataType::U32)
-                        .map_err(MatmulError::BackendError)?;
+        let (route_offsets, grouped_routes) = if let Some(routes) = routes {
+            let mut offsets = encoder
+                .allocate_scratch_for_shape(&[expert_count + 1], DataType::U32)
+                .map_err(MatmulError::BackendError)?;
+            let mut cursors = encoder
+                .allocate_scratch_for_shape(&[expert_count], DataType::U32)
+                .map_err(MatmulError::BackendError)?;
+            let mut grouped_routes =
+                encoder.allocate_scratch_for_shape(&[route_count], DataType::U32).map_err(MatmulError::BackendError)?;
 
-                    self.clear_counts.encode(&mut offsets, expert_count, encoder);
-                    self.count.encode(routes.expert_ids, &mut offsets, route_count, expert_count, encoder);
-                    self.prefix.encode(&mut offsets, &mut cursors, expert_count, encoder);
-                    self.scatter.encode(
-                        routes.expert_ids,
-                        &mut cursors,
-                        &mut grouped_routes,
-                        route_count,
-                        expert_count,
-                        encoder,
-                    );
-                    (
-                        MetalRoutePlan {
-                            offsets,
-                            grouped_routes,
-                        },
-                        true,
-                    )
-                },
-            };
-            (Some(route_plan_key), Some(route_plan), cache_route_plan)
+            self.clear_counts.encode(&mut offsets, expert_count, encoder);
+            self.count.encode(routes.expert_ids, &mut offsets, route_count, expert_count, encoder);
+            self.prefix.encode(&mut offsets, &mut cursors, expert_count, encoder);
+            self.scatter.encode(
+                routes.expert_ids,
+                &mut cursors,
+                &mut grouped_routes,
+                route_count,
+                expert_count,
+                encoder,
+            );
+            (Some(offsets), Some(grouped_routes))
         } else {
-            (None, None, false)
+            (None, None)
         };
 
         // Valid rows are written by grouped GEMM; zero only exceptional IDs.
@@ -241,7 +222,7 @@ impl RowTiledGemm {
             );
         }
 
-        let specialization = RowTiledGemmSpecialization {
+        let specialization = RoutedGemmSpecialization {
             output_transform,
             expert_bias: arguments.d_transform.per_matrix_bias.is_some(),
             microfloat_group_size,
@@ -259,8 +240,8 @@ impl RowTiledGemm {
             &mut *arguments.d,
             arguments.d_transform.bias,
             arguments.d_transform.per_matrix_bias,
-            route_plan.as_ref().map(|plan| &plan.offsets),
-            route_plan.as_ref().map(|plan| &plan.grouped_routes),
+            route_offsets.as_ref(),
+            grouped_routes.as_ref(),
             route_count,
             arguments.n,
             arguments.k,
@@ -272,9 +253,6 @@ impl RowTiledGemm {
             arguments.d_transform.soft_cap,
             encoder,
         );
-        if cache_route_plan && let (Some(route_plan_key), Some(route_plan)) = (route_plan_key, route_plan) {
-            encoder.as_command_buffer_mut().insert_route_plan(route_plan_key, route_plan);
-        }
         Ok(())
     }
 }

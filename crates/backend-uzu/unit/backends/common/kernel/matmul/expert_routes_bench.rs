@@ -2,9 +2,9 @@
 
 use std::num::NonZeroU32;
 
+use backend_uzu_macros::uzu_bench;
 use criterion::{BenchmarkId, Criterion, Throughput};
 use half::bf16;
-use backend_uzu_macros::uzu_bench;
 
 use crate::{
     array::ArrayElement,
@@ -14,8 +14,8 @@ use crate::{
             kernel::{
                 FullPrecisionEmbeddingLookupKernel,
                 matmul::{
-                    ExpertInput, ExpertRouteIdentity, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps,
-                    MatmulKernel, MatmulRouting,
+                    ExpertInput, ExpertRoutes, MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel,
+                    MatmulRouting,
                 },
             },
             microfloat::{MicrofloatFormat, MicrofloatLayout, MicrofloatMetadata},
@@ -94,7 +94,6 @@ fn bench_shape(
     let route_token_ids = alloc_allocation_with_data::<Metal, u32>(context, &route_token_ids);
     let expert_ids = distribution.expert_ids(route_count, expert_count);
     let expert_ids = alloc_allocation_with_data::<Metal, i32>(context, &expert_ids);
-    let route_identity = ExpertRouteIdentity::new();
     let mut expanded_input = alloc_allocation::<Metal, bf16>(context, route_count as usize * k as usize);
     let mut output = alloc_allocation::<Metal, bf16>(context, route_count as usize * n as usize);
     let mut matmul =
@@ -138,7 +137,6 @@ fn bench_shape(
                         d: &mut output,
                         d_transform: MatmulDOps::none(),
                         routing: MatmulRouting::Experts(ExpertRoutes {
-                            identity: &route_identity,
                             expert_ids: &expert_ids,
                             routes_per_token,
                             expert_count,
@@ -180,7 +178,6 @@ fn bench_shape(
                         d: &mut output,
                         d_transform: MatmulDOps::none(),
                         routing: MatmulRouting::Experts(ExpertRoutes {
-                            identity: &route_identity,
                             expert_ids: &expert_ids,
                             routes_per_token,
                             expert_count,

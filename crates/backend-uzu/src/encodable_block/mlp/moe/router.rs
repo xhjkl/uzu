@@ -1,10 +1,7 @@
 use std::num::NonZeroU32;
 
 use crate::{
-    backends::common::{
-        Allocation, Backend, Encoder, Kernels,
-        kernel::{MoeRouterTopKKernel, matmul::ExpertRouteIdentity},
-    },
+    backends::common::{Allocation, Backend, Encoder, Kernels, kernel::MoeRouterTopKKernel},
     data_type::DataType,
 };
 
@@ -16,7 +13,6 @@ fn checked_route_count(
 }
 
 pub struct MoeRoutes<B: Backend> {
-    pub identity: ExpertRouteIdentity,
     pub expert_ids: Allocation<B>,
     pub route_weights: Allocation<B>,
     pub token_count: u32,
@@ -33,7 +29,6 @@ impl<B: Backend> MoeRoutes<B> {
     ) -> Option<Self> {
         let route_count = checked_route_count(token_count, routes_per_token.get())?;
         Some(Self {
-            identity: ExpertRouteIdentity::new(),
             expert_ids,
             route_weights,
             token_count,
@@ -125,7 +120,7 @@ impl<B: Backend> MoeRouter<B> {
 
 #[cfg(test)]
 mod tests {
-    use proc_macros::uzu_test;
+    use backend_uzu_macros::uzu_test;
 
     use super::checked_route_count;
 

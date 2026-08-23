@@ -1,7 +1,7 @@
 #include <metal_atomic>
 #include <metal_stdlib>
 
-#include "../common/dsl.h"
+#include "../../common/dsl.h"
 
 using namespace metal;
 

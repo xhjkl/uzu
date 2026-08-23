@@ -507,8 +507,8 @@ fn bank_shape(
 mod tests {
     use std::io::Write;
 
+    use backend_uzu_macros::uzu_test;
     use half::bf16;
-    use proc_macros::uzu_test;
     use serde_json::{Map, Value, json};
     use tempfile::NamedTempFile;
 
