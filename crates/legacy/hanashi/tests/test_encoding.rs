@@ -95,7 +95,7 @@ fn run_encoding_test(
             }
 
             for token_id in completion_token_ids {
-                encoding.decode(vec![token_id]).unwrap();
+                encoding.decode_token(token_id).unwrap();
             }
             let assistant_message = encoding.state().messages.last().unwrap();
             let has_reasoning =

@@ -128,12 +128,9 @@ impl EncodingTrait for HanashiEncodingImpl {
         &mut self,
         token_ids: Self::Output,
     ) -> Result<(), Self::Error> {
-        for token_id in &token_ids {
-            let token = self.resolve_token(*token_id, true)?;
-            self.push_token_to_parser(&token, false)?;
-            self.state.tokens.push(token);
+        for token_id in token_ids {
+            self.process_decoded_token(token_id)?;
         }
-
         self.update_messages_from_parser_state()?;
         Ok(())
     }
@@ -154,6 +151,25 @@ impl HanashiEncodingImpl {
     ) -> Result<Vec<TokenId>, Error> {
         let encoding = self.tokenizer.encode(text, false).map_err(|_| Error::UnableToEncodeText)?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    pub fn decode_token(
+        &mut self,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        self.process_decoded_token(token_id)?;
+        self.update_messages_from_parser_state()?;
+        Ok(())
+    }
+
+    fn process_decoded_token(
+        &mut self,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        let token = self.resolve_token(token_id, true)?;
+        self.push_token_to_parser(&token, false)?;
+        self.state.tokens.push(token);
+        Ok(())
     }
 
     fn push_token_to_parser(

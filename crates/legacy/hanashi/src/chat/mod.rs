@@ -44,6 +44,13 @@ impl Encoding {
     ) -> Result<Vec<TokenId>, Error> {
         dispatch!(self, tokenize, text)
     }
+
+    pub fn decode_token(
+        &mut self,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        dispatch!(self, decode_token, token_id)
+    }
 }
 
 impl EncodingTrait for Encoding {

@@ -266,7 +266,7 @@ impl Session {
                 state.total_tokens_output += 1;
                 state.time_last_token = Some(now);
 
-                if let Err(err) = state.encoding.decode(vec![token as TokenId]) {
+                if let Err(err) = state.encoding.decode_token(token as TokenId) {
                     return Err(ChatSessionError::Backend {
                         message: err.to_string(),
                     });
