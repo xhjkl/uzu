@@ -3,7 +3,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -11,8 +11,8 @@ use std::{
 use metal::MTLSharedEvent;
 use metal::{
     MTL4CommandQueue, MTL4CommandQueueExt, MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager,
-    MTLCommandBufferExt, MTLCommandQueue, MTLCommandQueueExt, MTLComputePipelineState, MTLDevice, MTLDeviceExt,
-    MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSparsePageSize,
+    MTLCommandBuffer, MTLCommandBufferExt, MTLCommandQueue, MTLCommandQueueExt, MTLComputePipelineState, MTLDevice,
+    MTLDeviceExt, MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSparsePageSize,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use parking_lot::{Mutex, MutexGuard};
@@ -37,7 +37,7 @@ pub struct MetalContext {
     pub command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub command_queue4: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     timeline_event: Retained<ProtocolObject<dyn MTLEvent>>,
-    timeline_value: AtomicU64,
+    timeline: Mutex<TimelineState>,
     allocator: Arc<Allocator<Metal>>,
     peak_memory_usage: AtomicUsize,
     library_cache: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLLibrary>>>>,
@@ -47,6 +47,35 @@ pub struct MetalContext {
     weak_self: Weak<MetalContext>,
     #[cfg(test)]
     timeline_shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+#[derive(Debug, Default)]
+struct TimelineState {
+    scheduled_value: u64,
+    mapping_signal_value: u64,
+    compute_waited_mapping_value: u64,
+}
+
+impl TimelineState {
+    fn reserve_mapping(&mut self) -> (u64, u64) {
+        let wait_value = self.scheduled_value;
+        let signal_value = wait_value + 1;
+        self.scheduled_value = signal_value;
+        self.mapping_signal_value = signal_value;
+        (wait_value, signal_value)
+    }
+
+    fn reserve_compute(&mut self) -> (Option<u64>, u64) {
+        let mapping_wait =
+            (self.mapping_signal_value > self.compute_waited_mapping_value).then_some(self.mapping_signal_value);
+        if let Some(mapping_wait) = mapping_wait {
+            self.compute_waited_mapping_value = mapping_wait;
+        }
+
+        let signal_value = self.scheduled_value + 1;
+        self.scheduled_value = signal_value;
+        (mapping_wait, signal_value)
+    }
 }
 
 impl MetalContext {
@@ -122,24 +151,38 @@ impl MetalContext {
             return;
         }
 
-        let wait_value = self.timeline_get_and_increment();
+        // Hold the ticket lock until the complete MTL4 batch is queued.
+        let mut timeline = self.timeline.lock();
+        let (wait_value, signal_value) = timeline.reserve_mapping();
         self.command_queue4.wait_for_event_value(&self.timeline_event, wait_value);
         for op in mappings {
             self.command_queue4.update_buffer_mappings(&op.buffer, Some(op.heap.lock().heap()), &op.mtl_operations);
         }
-        self.command_queue4.signal_event_value(&self.timeline_event, wait_value + 1);
+        self.command_queue4.signal_event_value(&self.timeline_event, signal_value);
+        drop(timeline);
 
         // This line prevent tests from freezing, showing pink screen and shutting down computer
         #[cfg(test)]
         self.timeline_shared_event.wait_until_signaled_value_timeout_ms(wait_value, 10);
     }
 
-    pub(super) fn timeline_get_and_increment(&self) -> u64 {
-        self.timeline_value.fetch_add(1, Ordering::Release)
-    }
+    /// Commits compute work in cross-queue timeline order.
+    pub(super) fn submit_compute(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) {
+        // Consume a mapping wait only once it precedes this work on the queue.
+        let mut timeline = self.timeline.lock();
+        let (mapping_wait, signal_value) = timeline.reserve_compute();
+        if let Some(mapping_wait) = mapping_wait {
+            let wait_buffer = self.command_queue.command_buffer().expect("Failed to create sparse mapping wait");
+            wait_buffer.set_label(Some("sync (sparse mapping wait)"));
+            wait_buffer.encode_wait_for_event_value(&self.timeline_event, mapping_wait);
+            wait_buffer.commit();
+        }
 
-    pub(super) fn timeline_event(&self) -> &ProtocolObject<dyn MTLEvent> {
-        &self.timeline_event
+        command_buffer.encode_signal_event_value(&self.timeline_event, signal_value);
+        command_buffer.commit();
     }
 }
 
@@ -171,7 +214,7 @@ impl Context for MetalContext {
             command_queue,
             command_queue4,
             timeline_event,
-            timeline_value: AtomicU64::new(0),
+            timeline: Mutex::new(TimelineState::default()),
             allocator: Allocator::new(weak_self.clone()),
             peak_memory_usage: AtomicUsize::new(0),
             library_cache: Mutex::new(HashMap::new()),
@@ -277,5 +320,50 @@ impl Context for MetalContext {
             capabilities |= DeviceCapabilities::SPARSE_BUFFERS;
         }
         capabilities
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use uzu_engine_macros::uzu_test;
+
+    use super::MetalContext;
+    use crate::{
+        backends::common::{Context, Encoder, SparseBuffer},
+        tests::helpers::{alloc_allocation, alloc_allocation_with_data, allocation_to_vec, sparse_buffer_create},
+    };
+
+    #[uzu_test]
+    fn compute_mapping_compute_chain_exposes_the_new_sparse_pages() {
+        const BYTE_COUNT: usize = 4096;
+
+        let context = MetalContext::new().expect("create Metal context");
+        let mut first_marker = alloc_allocation::<crate::backends::metal::Metal, u8>(&context, BYTE_COUNT);
+        let mut first_encoder = Encoder::new(context.as_ref()).expect("create first encoder");
+        first_encoder.encode_fill(&mut first_marker, 0xa5);
+        let first_pending = first_encoder.end_encoding().submit();
+
+        let mut sparse = sparse_buffer_create::<crate::backends::metal::Metal>(&context, BYTE_COUNT);
+        sparse.map(&context, &(0..1)).expect("map sparse page between compute submits");
+
+        let expected: Vec<u8> = (0..BYTE_COUNT).map(|index| (index % 251) as u8).collect();
+        let source = alloc_allocation_with_data::<crate::backends::metal::Metal, u8>(&context, &expected);
+        let mut readback = alloc_allocation::<crate::backends::metal::Metal, u8>(&context, BYTE_COUNT);
+        let mut marker_readback = alloc_allocation::<crate::backends::metal::Metal, u8>(&context, BYTE_COUNT);
+        let mut second_encoder = Encoder::new(context.as_ref()).expect("create second encoder");
+        second_encoder.encode_copy(&source, .., &mut sparse, ..BYTE_COUNT);
+        second_encoder.encode_copy(&sparse, ..BYTE_COUNT, &mut readback, ..);
+        second_encoder.encode_copy(&first_marker, .., &mut marker_readback, ..);
+        let second_pending = second_encoder.end_encoding().submit();
+
+        second_pending.wait_until_completed().expect("complete compute after mapping");
+        first_pending.wait_until_completed().expect("complete compute before mapping");
+        assert_eq!(allocation_to_vec::<crate::backends::metal::Metal, u8>(&readback), expected);
+        assert!(
+            allocation_to_vec::<crate::backends::metal::Metal, u8>(&marker_readback)
+                .into_iter()
+                .all(|byte| byte == 0xa5),
+            "second compute observed data before the first compute completed",
+        );
     }
 }
