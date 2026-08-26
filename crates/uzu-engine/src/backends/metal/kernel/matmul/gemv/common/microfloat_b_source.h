@@ -22,19 +22,25 @@ struct MicrofloatBSource {
     const uint code_row_bytes = params.in_vec_size / 2;
     const uint scale_row_bytes = params.in_vec_size / GROUP_SIZE;
     const float outer_scale = float(ops.outer_scales[0]);
+    const uint last_row = params.out_vec_size > 0 ? params.out_vec_size - 1 : 0;
 
     uint weight_rows[Tile::ROWS_PER_LANE];
     Tile::for_each_output_row([&](auto output_index) UZU_ALWAYS_INLINE {
       constexpr uint R = decltype(output_index)::value;
       const uint output_row = tile.row0 + R;
+      const uint lookup_row = FULL_TILE ? output_row : min(output_row, last_row);
       weight_rows[R] =
-          params.gathered ? ops.gather_indices[tile.input_row * params.out_vec_size + output_row] : output_row;
+          params.gathered ? ops.gather_indices[tile.input_row * params.out_vec_size + lookup_row] : lookup_row;
     });
 
     for (uint inner = tile.reduction_lane; inner < params.in_vec_size; inner += Tile::REDUCTION_LANES) {
       const float input_value = float(ops.a[tile.input_row * params.in_vec_size + inner]);
       Tile::for_each_output_row([&](auto output_index) UZU_ALWAYS_INLINE {
         constexpr uint R = decltype(output_index)::value;
+        const uint output_row = tile.row0 + R;
+        if (!OutputTile<Tile, FULL_TILE>::row_in_range(output_row, params.out_vec_size)) {
+          return;
+        }
         const uint row = weight_rows[R];
         const uint8_t packed = reinterpret_cast<const device uint8_t*>(ops.b)[row * code_row_bytes + inner / 2];
         const uint code = (inner & 1u) == 0 ? packed & 0x0fu : packed >> 4u;

@@ -1,6 +1,11 @@
+use std::fmt::Display;
+
+use half::bf16;
+use num_traits::Float;
 use uzu_engine_macros::uzu_test;
 
 use crate::{
+    array::ArrayElement,
     backends::{
         common::{
             Backend, Context, Encoder, Kernels,
@@ -18,37 +23,92 @@ use crate::{
 
 const K: usize = 32;
 const N: usize = 4;
+const E2M1_THREE_CODE: u8 = 5;
 
-fn packed_codes() -> Vec<u8> {
-    (0..N * K / 2)
+#[derive(Clone, Copy)]
+enum OutputOps {
+    None,
+    Scale,
+    All,
+}
+
+#[derive(Clone, Copy)]
+struct Mxfp4Case {
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    outer_scale: f32,
+    uniform_code: Option<u8>,
+    uniform_input: Option<f32>,
+    output_ops: OutputOps,
+    tolerance: f32,
+}
+
+fn packed_codes(
+    rows: usize,
+    columns: usize,
+) -> Vec<u8> {
+    (0..rows * columns / 2)
         .map(|index| {
-            let low = (index % 7 + 1) as u8;
-            let high = ((index * 3 + 1) % 7 + 1) as u8;
+            let low = ((index * 5 + 1) % 16) as u8;
+            let high = ((index * 7 + 3) % 16) as u8;
             low | (high << 4)
         })
         .collect()
 }
 
-fn execute_mxfp4<B: Backend>(
-    row_count: usize,
-    group_size: usize,
-    input_values: &[f32],
-    codes: &[u8],
-    scales: &[u8],
-) -> Vec<f32> {
+fn execute_mxfp4<B: Backend, T: ArrayElement + Float>(case: Mxfp4Case) -> Vec<T> {
+    let Mxfp4Case {
+        m,
+        n,
+        k,
+        group_size,
+        outer_scale,
+        uniform_code,
+        uniform_input,
+        output_ops,
+        tolerance: _,
+    } = case;
     let encoding =
         MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 4, group_size as u32).expect("valid MXFP4 encoding");
-    let metadata = MicrofloatMetadata::new(encoding, N as u32, K as u32).expect("valid dense MXFP4 metadata");
+    let metadata = MicrofloatMetadata::new(encoding, n as u32, k as u32).expect("valid dense MXFP4 metadata");
     let context = B::Context::new().expect("create backend context");
-    let input = alloc_allocation_with_data::<B, f32>(context.as_ref(), input_values);
-    let codes = alloc_allocation_with_data::<B, u8>(context.as_ref(), codes);
-    let scales = alloc_allocation_with_data::<B, u8>(context.as_ref(), scales);
-    let outer_scales = alloc_allocation_with_data::<B, f32>(context.as_ref(), &[1.25]);
-    let mut output = alloc_allocation::<B, f32>(context.as_ref(), row_count * N);
+    let input_values: Vec<T> =
+        (0..m * k).map(|index| T::from(uniform_input.unwrap_or((index % 13) as f32 * 0.125 - 0.5)).unwrap()).collect();
+    let codes = match uniform_code {
+        Some(code) => vec![code | code << 4; n * k / 2],
+        None => packed_codes(n, k),
+    };
+    let scales: Vec<u8> = (0..n * k / group_size).map(|index| 126 + (index % 3) as u8).collect();
+    let outer_scale = [T::from(outer_scale).unwrap()];
+    let output_values: Vec<T> =
+        (0..m * n).map(|index| T::from((index % 7) as f32 * 0.03125 - 0.0625).unwrap()).collect();
+    let bias_values: Vec<T> = (0..n).map(|index| T::from((index % 5) as f32 * 0.0625 - 0.125).unwrap()).collect();
+    let input = alloc_allocation_with_data::<B, T>(context.as_ref(), &input_values);
+    let codes = alloc_allocation_with_data::<B, u8>(context.as_ref(), &codes);
+    let scales = alloc_allocation_with_data::<B, u8>(context.as_ref(), &scales);
+    let outer_scales = alloc_allocation_with_data::<B, T>(context.as_ref(), &outer_scale);
+    let bias = alloc_allocation_with_data::<B, T>(context.as_ref(), &bias_values);
+    let mut output = alloc_allocation_with_data::<B, T>(context.as_ref(), &output_values);
     let mut kernel =
-        <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
+        <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), T::data_type(), T::data_type(), T::data_type())
             .expect("create matmul kernel");
     let mut encoder = Encoder::<B>::new(context.as_ref()).expect("create encoder");
+    let d_transform = match output_ops {
+        OutputOps::None => MatmulDOps::none(),
+        OutputOps::Scale => MatmulDOps {
+            ab_scale: 0.75,
+            ..MatmulDOps::none()
+        },
+        OutputOps::All => MatmulDOps {
+            ab_scale: 0.75,
+            accumulate: true,
+            bias: Some(&bias),
+            rht_factors: None,
+            soft_cap: Some(2.0),
+        },
+    };
     kernel
         .encode(
             MatmulArguments {
@@ -65,17 +125,17 @@ fn execute_mxfp4<B: Backend>(
                 b_leading_dimension: None,
                 b_transpose: true,
                 d: &mut output,
-                d_transform: MatmulDOps::none(),
+                d_transform,
                 gather_indices: None,
-                m: row_count as u32,
-                n: N as u32,
-                k: K as u32,
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
             },
             &mut encoder,
         )
         .expect("encode MXFP4 matmul");
     encoder.end_encoding().submit().wait_until_completed().expect("execute MXFP4 matmul");
-    allocation_to_vec::<B, f32>(&output)
+    allocation_to_vec::<B, T>(&output)
 }
 
 #[uzu_test]
@@ -83,7 +143,7 @@ fn cpu_executes_dense_mxfp4_matmul() {
     for row_count in [1, 5] {
         for group_size in [16, 32] {
             let input_values: Vec<f32> = (0..row_count * K).map(|index| (index % 13) as f32 * 0.125 - 0.5).collect();
-            let codes = packed_codes();
+            let codes = packed_codes(N, K);
             let scales: Vec<u8> = (0..N * K / group_size).map(|index| 126 + (index % 3) as u8).collect();
             let outer_scales = [1.25f32];
             let encoding =
@@ -157,17 +217,54 @@ fn cpu_executes_dense_mxfp4_matmul() {
 
 #[uzu_test]
 fn metal_matches_cpu_for_mxfp4_gemv_and_gemm() {
-    for row_count in [1, 12] {
-        for group_size in [16, 32] {
-            let input_values: Vec<f32> = (0..row_count * K).map(|index| (index % 13) as f32 * 0.125 - 0.5).collect();
-            let codes = packed_codes();
-            let scales: Vec<u8> = (0..N * K / group_size).map(|index| 126 + (index % 3) as u8).collect();
-            let expected = execute_mxfp4::<Cpu>(row_count, group_size, &input_values, &codes, &scales);
-
-            for_each_non_cpu_backend!(|B| {
-                let actual = execute_mxfp4::<B>(row_count, group_size, &input_values, &codes, &scales);
-                assert_eq_float(&expected, &actual, 1e-4, std::any::type_name::<B>());
-            });
-        }
+    fn compare<T: ArrayElement + Float + Display>(case: Mxfp4Case) {
+        let expected = execute_mxfp4::<Cpu, T>(case);
+        for_each_non_cpu_backend!(|B| {
+            let actual = execute_mxfp4::<B, T>(case);
+            assert_eq_float(&expected, &actual, case.tolerance, std::any::type_name::<B>());
+        });
     }
+
+    let case = |m, n, group_size| Mxfp4Case {
+        m,
+        n,
+        k: 160,
+        group_size,
+        outer_scale: 1.3,
+        uniform_code: None,
+        uniform_input: None,
+        output_ops: OutputOps::All,
+        tolerance: 0.05,
+    };
+
+    compare::<f32>(Mxfp4Case {
+        m: 1,
+        n: 1,
+        k: 32,
+        group_size: 16,
+        outer_scale: 1.3,
+        uniform_code: None,
+        uniform_input: None,
+        output_ops: OutputOps::None,
+        tolerance: 1e-4,
+    });
+    compare::<bf16>(case(8, 32, 32));
+    compare::<bf16>(case(9, 17, 16));
+    compare::<bf16>(case(9, 17, 32));
+    compare::<f32>(Mxfp4Case {
+        tolerance: 1e-3,
+        ..case(9, 17, 32)
+    });
+    let outer_scale_rounding = Mxfp4Case {
+        m: 9,
+        n: 1,
+        k: 32,
+        group_size: 32,
+        outer_scale: 1.0078125,
+        uniform_code: Some(E2M1_THREE_CODE),
+        uniform_input: Some(1.0),
+        output_ops: OutputOps::Scale,
+        tolerance: 0.0,
+    };
+    compare::<bf16>(outer_scale_rounding);
 }

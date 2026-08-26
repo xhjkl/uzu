@@ -41,13 +41,25 @@ struct LeftOperand {
 template <GemmBPrologueKind PROLOGUE, ushort BITS_, ushort GROUP_SIZE_, typename Element>
 struct RightOperand {
   UZU_CONST bool QUANTIZED = PROLOGUE != GemmBPrologueKind::FullPrecision;
-  UZU_CONST ushort BITS = QUANTIZED ? BITS_ : 0;
-  UZU_CONST ushort GROUP_SIZE = QUANTIZED ? GROUP_SIZE_ : 0;
+  UZU_CONST bool MICROFLOAT = !QUANTIZED && BITS_ == 4;
+  UZU_CONST bool DENSE = !QUANTIZED && !MICROFLOAT;
+  UZU_CONST bool PACKED = QUANTIZED || MICROFLOAT;
+  UZU_CONST ushort BITS = PACKED ? BITS_ : 0;
+  UZU_CONST ushort GROUP_SIZE = PACKED ? GROUP_SIZE_ : 0;
   UZU_CONST GemmBPrologueKind SCHEME = PROLOGUE;
   UZU_CONST bool NEEDS_CORRECTION = QUANTIZED && PROLOGUE != GemmBPrologueKind::ScaleSymmetricDequant;
 
-  static_assert(!QUANTIZED || BITS_ == 4 || BITS_ == 8, "quantized integer weights must use 4 or 8 bits");
-  static_assert(!QUANTIZED || PROLOGUE != GemmBPrologueKind::FullPrecision, "quantized weights need a scheme");
+  static_assert(!DENSE || (BITS_ == 0 && GROUP_SIZE_ == 0), "dense weights do not have packing parameters");
+  static_assert(!QUANTIZED || BITS_ == 4 || BITS_ == 8, "integer weights must use 4 or 8 bits");
+  static_assert(!QUANTIZED || PROLOGUE != GemmBPrologueKind::FullPrecision, "integer weights need a scheme");
+  static_assert(
+      !MICROFLOAT || (BITS_ == 4 && (GROUP_SIZE_ == 16 || GROUP_SIZE_ == 32)),
+      "MXFP4 weights require 4-bit codes in groups of 16 or 32"
+  );
+  static_assert(
+      !MICROFLOAT || PROLOGUE == GemmBPrologueKind::FullPrecision,
+      "MXFP4 does not use an integer dequantization prologue"
+  );
 
   using CodeElement = int8_t;
   using ScaleElement = Element;
@@ -90,6 +102,8 @@ struct RightStorage {
   const device typename Right::ScaleElement* scales;
   const device typename Right::ScaleElement* biases;
   const device uint8_t* zero_points;
+  const device uint8_t* microfloat_scales;
+  const device typename Right::ScaleElement* microfloat_outer_scale;
   bool signed_codes;
 
   METAL_FUNC const device typename Right::ScaleElement* bias() const thread {
@@ -103,6 +117,16 @@ struct RightStorage {
         "zp is only valid for ScaleZeroPointDequant"
     );
     return zero_points;
+  }
+
+  METAL_FUNC const device uint8_t* mxfp4_scales() const thread {
+    static_assert(Right::MICROFLOAT, "mxfp4_scales is only valid for MXFP4 weights");
+    return microfloat_scales;
+  }
+
+  METAL_FUNC float mxfp4_outer_scale() const thread {
+    static_assert(Right::MICROFLOAT, "mxfp4_outer_scale is only valid for MXFP4 weights");
+    return float(microfloat_outer_scale[0]);
   }
 };
 
@@ -126,18 +150,34 @@ METAL_FUNC RightStorage<Right> pack_right(
     const device Element* scales,
     const device Element* biases,
     const device uint8_t* zero_points,
+    const device uint8_t* microfloat_scales,
+    const device Element* microfloat_outer_scale,
     const bool signed_codes
 ) {
-  if constexpr (!Right::QUANTIZED) {
-    return {dense, nullptr, nullptr, nullptr, nullptr, false};
-  } else {
+  if constexpr (Right::DENSE) {
+    return {dense, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false};
+  } else if constexpr (Right::QUANTIZED) {
     return {
         nullptr,
         reinterpret_cast<const device uint8_t*>(dense),
         scales,
         Right::SCHEME == GemmBPrologueKind::ScaleBiasDequant ? biases : nullptr,
         Right::SCHEME == GemmBPrologueKind::ScaleZeroPointDequant ? zero_points : nullptr,
+        nullptr,
+        nullptr,
         signed_codes
+    };
+  } else {
+    static_assert(Right::MICROFLOAT, "unsupported packed weight format");
+    return {
+        nullptr,
+        reinterpret_cast<const device uint8_t*>(dense),
+        nullptr,
+        nullptr,
+        nullptr,
+        microfloat_scales,
+        microfloat_outer_scale,
+        false
     };
   }
 }

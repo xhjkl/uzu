@@ -16,8 +16,8 @@ use crate::{
             kernel::{
                 activation_transform::ACTIVATION_SCALE_GROUP_SIZE,
                 matmul::{
-                    A8ActivationPlan, ActivationFormat, MatmulArguments, MatmulB, MatmulError, MatmulKernel,
-                    MatmulShape,
+                    A8ActivationPlan, ActivationFormat, MatmulArguments, MatmulB, MatmulBKind, MatmulError,
+                    MatmulKernel, MatmulShape,
                 },
             },
         },
@@ -89,8 +89,14 @@ impl MatmulMetalKernel {
                 QmvRoute::MainGemm(plan) => MatmulDispatch::Gemm(plan),
             };
         }
-        let gemv =
-            GemvSpecialization::select_shape(shape, weights_data_type, input_data_type, output_data_type, profile);
+        let gemv = match shape.b_kind {
+            MatmulBKind::Mxfp4 => {
+                GemvSpecialization::select_microfloat(shape, weights_data_type, input_data_type, output_data_type)
+            },
+            MatmulBKind::Dense | MatmulBKind::Integer => {
+                GemvSpecialization::select_shape(shape, weights_data_type, input_data_type, output_data_type, profile)
+            },
+        };
         let problem = GemmProblem::new(*shape, weights_data_type, output_data_type, supports_mxu, profile);
         let plan = problem.select_plan();
         match gemv {
@@ -225,16 +231,6 @@ impl MatmulKernel for MatmulMetalKernel {
             {
                 return Err(MatmulError::InvalidMicrofloatStorage.into());
             }
-            let gemv = GemvSpecialization::select_microfloat(
-                &shape,
-                self.weights_data_type,
-                self.input_data_type,
-                self.output_data_type,
-            );
-            if let Some(gemv) = gemv {
-                return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from);
-            }
-            return self.gemm.encode_microfloat(arguments, encoder);
         }
         let plan = match self.select_dispatch(&shape, encoder.context()) {
             MatmulDispatch::Gemv(gemv) => {

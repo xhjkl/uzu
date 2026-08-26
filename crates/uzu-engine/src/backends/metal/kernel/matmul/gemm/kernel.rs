@@ -2,7 +2,6 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use super::{
     GemmEngine, GemmPlan,
-    microfloat::MicrofloatGemmDispatch,
     selection::{GemmProblem, outer_block_k},
     specialization::GemmSpecialization,
 };
@@ -38,7 +37,6 @@ pub struct GemmKernel {
     pub bias_add: TensorAddBiasMetalKernel,
     output_rht: ActivationTransform<Metal>,
     split_k_reduce: HashMap<GemmDTransform, GemmSplitKReduceMetalKernel>,
-    microfloat: MicrofloatGemmDispatch,
 }
 
 impl GemmKernel {
@@ -58,7 +56,6 @@ impl GemmKernel {
             bias_add,
             output_rht,
             split_k_reduce: HashMap::new(),
-            microfloat: MicrofloatGemmDispatch::new(weights_data_type, input_data_type, output_data_type),
         };
         Ok(kernel)
     }
@@ -153,7 +150,7 @@ impl GemmKernel {
             .validate_engine(plan.engine)
             .map_err(|error| MetalError::KernelDispatchFailed(Box::new(error)))?;
 
-        let is_quant = !matches!(arguments.b, MatmulB::FullPrecision { .. });
+        let is_quant = shape.is_quant();
         if is_quant {
             let d_mask = arguments.d_transform.mask();
             if d_mask.contains(GemmDTransform::ACCUMULATE) {
@@ -166,6 +163,7 @@ impl GemmKernel {
         }
 
         let ab_scale = arguments.d_transform.ab_scale;
+        let soft_cap = arguments.d_transform.soft_cap.unwrap_or(0.0);
         let output_bias = arguments.d_transform.bias;
         let rht_factors = arguments.d_transform.rht_factors;
         let output_transform = arguments.d_transform.mask();
@@ -191,10 +189,68 @@ impl GemmKernel {
 
         match b {
             MatmulB::Microfloat {
-                metadata,
+                codes,
+                scales,
+                outer_scales,
                 ..
             } => {
-                return Err(MatmulError::UnsupportedMicrofloat(metadata.format()).into());
+                if output_transform.contains(GemmDTransform::RHT) {
+                    return Err(MatmulError::UnsupportedDOp {
+                        bit: GemmDTransform::RHT,
+                        path: "MXFP4 GEMM",
+                    }
+                    .into());
+                }
+                let MatmulA::FullPrecision {
+                    values: a,
+                    offset: a_offset,
+                } = a
+                else {
+                    return Err(MatmulError::IncompatibleA {
+                        path: "MXFP4 GEMM",
+                        reason: "int8 activations require integer weights",
+                    }
+                    .into());
+                };
+                let tiling = plan.tiling;
+                let alignment = GemmAlignment::new(
+                    m.is_multiple_of(tiling.block_m()),
+                    n.is_multiple_of(tiling.block_n()),
+                    k.is_multiple_of(tiling.block_k()),
+                );
+                let params = packed_params(shape, plan, ab_scale, soft_cap);
+                let group_count_x = n.div_ceil(tiling.block_n());
+                let group_count_y = m.div_ceil(tiling.block_m());
+                let specialization = GemmSpecialization::from_plan(
+                    plan,
+                    shape,
+                    self.weights_data_type,
+                    output_transform,
+                    alignment,
+                    GemmAPrologueKind::FullPrecision,
+                    None,
+                )?;
+                let kernel = self.get_or_create(encoder.context(), specialization)?;
+                kernel.encode(
+                    Some((a, a_offset)),
+                    codes,
+                    &mut *d,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
+                    Some(scales),
+                    Some(outer_scales),
+                    output_bias,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
+                    std::slice::from_ref(&params),
+                    group_count_x,
+                    group_count_y,
+                    1,
+                    encoder,
+                );
             },
             MatmulB::FullPrecision {
                 b: weights,
@@ -273,6 +329,7 @@ impl GemmKernel {
                     aligned_inner_iterations: k / tiling.block_k(),
                     use_morton,
                     ab_scale,
+                    soft_cap,
                 };
 
                 let specialization = GemmSpecialization::from_plan(
@@ -289,6 +346,8 @@ impl GemmKernel {
                     Some((a, a_offset)),
                     weights,
                     &mut *d,
+                    None::<&Allocation<Metal>>,
+                    None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
@@ -376,7 +435,7 @@ impl GemmKernel {
                 let tiling = plan.tiling;
                 let alignment =
                     GemmAlignment::new(m % tiling.block_m() == 0, n % tiling.block_n() == 0, k % tiling.block_k() == 0);
-                let params = quant_params(shape, plan, ab_scale);
+                let params = packed_params(shape, plan, ab_scale, soft_cap);
                 let group_count_x = n.div_ceil(tiling.block_n());
                 let group_count_y = m.div_ceil(tiling.block_m());
 
@@ -414,6 +473,8 @@ impl GemmKernel {
                         scales,
                         biases,
                         zero_points,
+                        None::<&Allocation<Metal>>,
+                        None::<&Allocation<Metal>>,
                         output_bias,
                         rht_factors,
                         a_int8,
@@ -435,14 +496,6 @@ impl GemmKernel {
         }
 
         Ok(())
-    }
-
-    pub(in crate::backends::metal::kernel::matmul) fn encode_microfloat<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
-        &mut self,
-        arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
-        encoder: &mut Encoder<Metal>,
-    ) -> Result<(), MetalError> {
-        self.microfloat.encode(arguments, encoder)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -514,6 +567,7 @@ impl GemmKernel {
             aligned_inner_iterations: kp / k_step,
             use_morton: false,
             ab_scale: 1.0,
+            soft_cap: 0.0,
         };
         let part_kernel = self.get_or_create(encoder.context(), part_spec)?;
         part_kernel.encode(
@@ -523,6 +577,8 @@ impl GemmKernel {
             scales,
             biases,
             zero_points,
+            None::<&Allocation<Metal>>,
+            None::<&Allocation<Metal>>,
             None::<&Allocation<Metal>>,
             None::<&Allocation<Metal>>,
             a_int8,
@@ -592,10 +648,11 @@ fn validate_int8_activation_arguments(
     Ok(())
 }
 
-fn quant_params(
+fn packed_params(
     shape: MatmulShape,
     plan: GemmPlan,
     ab_scale: f32,
+    soft_cap: f32,
 ) -> GemmParams {
     let MatmulShape {
         m,
@@ -616,5 +673,6 @@ fn quant_params(
         aligned_inner_iterations: outer_block_k(shape, plan.engine, plan.tiling).map_or(0, |step| k / step),
         use_morton: false,
         ab_scale,
+        soft_cap,
     }
 }

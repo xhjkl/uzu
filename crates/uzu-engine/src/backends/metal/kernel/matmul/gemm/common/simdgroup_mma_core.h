@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../common/integral_constant.h"
+#include "../../../common/soft_cap.h"
 #include "../../../common/thread_context.h"
 #include "../../common/defines.h"
 #include "../../common/loader.h"
@@ -142,6 +143,7 @@ struct SimdgroupMmaCore {
       const thread uzu::matmul::TransformScaleAccumulate<float, float>& epilogue,
       const device RightElementType* bias_block,
       const bool needs_bias,
+      const bool needs_soft_cap,
       const device int32_t* rht_factors_block,
       const bool needs_rht,
       const thread ThreadContext& thread_context
@@ -154,6 +156,11 @@ struct SimdgroupMmaCore {
       if (needs_bias) {
         accumulator.apply_bias(bias_block);
       }
+      if constexpr (Right::MICROFLOAT) {
+        if (needs_soft_cap) {
+          accumulator.c_fragment.map([&](float value) { return uzu::apply_soft_cap(value, params->soft_cap); });
+        }
+      }
       accumulator.store_result(d, params->leading_dimension_d);
     } else {
       if (needs_epilogue) {
@@ -162,6 +169,11 @@ struct SimdgroupMmaCore {
       }
       if (needs_bias) {
         accumulator.apply_bias_safe(bias_block, short2(tile_block_cols, tile_block_rows));
+      }
+      if constexpr (Right::MICROFLOAT) {
+        if (needs_soft_cap) {
+          accumulator.c_fragment.map([&](float value) { return uzu::apply_soft_cap(value, params->soft_cap); });
+        }
       }
       accumulator.store_result_safe(d, params->leading_dimension_d, short2(tile_block_cols, tile_block_rows));
     }
@@ -228,6 +240,10 @@ struct SimdgroupMmaCore {
     const bool needs_scale = output_transform.contains(GemmDTransform::SCALE);
     const bool needs_accumulate = output_transform.contains(GemmDTransform::ACCUMULATE);
     const bool needs_bias = output_transform.contains(GemmDTransform::BIAS);
+    bool needs_soft_cap = false;
+    if constexpr (Right::MICROFLOAT) {
+      needs_soft_cap = output_transform.contains(GemmDTransform::SOFT_CAP);
+    }
     const bool needs_rht = output_transform.contains(GemmDTransform::RHT);
     const bool needs_epilogue = needs_scale || needs_accumulate;
     const float alpha = needs_scale ? params->ab_scale : 1.0f;
@@ -259,6 +275,11 @@ struct SimdgroupMmaCore {
             tile_block_cols,
             leftover_block_depth
         );
+        if constexpr (Right::MICROFLOAT) {
+          // Keep the outer scale in f32; E2M1 x E8M0 is exact in BF16 staging.
+          const float outer_scale = right.mxfp4_outer_scale();
+          accumulator.c_fragment.map([&](float value) { return value * outer_scale; });
+        }
         finalize<gemm_alignment>(
             accumulator,
             d,
@@ -269,6 +290,7 @@ struct SimdgroupMmaCore {
             epilogue,
             bias_block,
             needs_bias,
+            needs_soft_cap,
             rht_factors_block,
             needs_rht,
             thread_context
@@ -282,8 +304,18 @@ struct SimdgroupMmaCore {
       }
     };
 
-    if constexpr (!Right::QUANTIZED) {
+    if constexpr (Right::DENSE) {
       auto loader_b = schedules::make_full_precision_loader<SimdgroupMmaCore>(
+          right,
+          params,
+          block_col,
+          k_offset,
+          b_shared,
+          thread_context
+      );
+      run_with_loader(loader_b);
+    } else if constexpr (Right::MICROFLOAT) {
+      auto loader_b = schedules::make_mxfp4_loader<SimdgroupMmaCore, RightOperand>(
           right,
           params,
           block_col,

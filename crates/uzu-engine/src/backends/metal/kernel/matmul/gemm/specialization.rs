@@ -99,8 +99,8 @@ impl GemmSpecialization {
                 });
             }
         }
-        if self.b_prologue != GemmBPrologueKind::FullPrecision && !self.transpose_b {
-            return Err(GemmSpecializationError::QuantizedRequiresTransposedB);
+        if self.bits_per_b.is_some() && !self.transpose_b {
+            return Err(GemmSpecializationError::PackedRequiresTransposedB);
         }
         Ok(())
     }
