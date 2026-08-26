@@ -13,7 +13,7 @@ use crate::{
             gpu_types::QuantizationMethod,
             kernel::{
                 Kernels,
-                matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel},
+                matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting},
             },
         },
         cpu::Cpu,
@@ -88,7 +88,12 @@ fn run_gemv<'a, B: Backend, T: ArrayElement + Float>(
                     soft_cap,
                     ..MatmulDOps::none()
                 },
-                gather_indices,
+                routing: match gather_indices {
+                    Some(b_rows) => MatmulRouting::SparseReadout {
+                        b_rows,
+                    },
+                    None => MatmulRouting::Dense,
+                },
                 m: m as u32,
                 n: n_out as u32,
                 k: k as u32,
@@ -141,6 +146,8 @@ fn test<T: ArrayElement + Float + Debug + Display>(
 #[case::unaligned_n(1, 128, 11)]
 #[case::large(1, 4096, 2048)]
 #[case::small_n(1, 128, 3)]
+#[case::ragged_k_wide(1, 2880, 5120)]
+#[case::ragged_k_tall(1, 4096, 2880)]
 fn gemv_bf16(
     #[case] m: usize,
     #[case] k: usize,
@@ -235,26 +242,57 @@ fn gemv_gather() {
         fp_gather_case::<f32>(soft_cap, 0.01);
     }
     // Quantized (bf16, per bits/method) — inline, since it isn't type-generic.
-    for (bits, method) in [
-        (4, QuantizationMethod::ScaleBias),
-        (4, QuantizationMethod::ScaleZeroPoint),
-        (4, QuantizationMethod::ScaleSymmetric),
-        (8, QuantizationMethod::ScaleZeroPoint),
-    ] {
-        let (m, k, vocab, ids_per_row, group_size) = (8usize, 128usize, 64usize, 8usize, 32u32);
-        let input = QuantInput::<bf16>::new(m as u32, k as u32, vocab as u32, group_size, bits, method, 0x5EED);
-        let ids: Vec<u32> = (0..m * ids_per_row).map(|i| ((i * 37 + 11) % vocab) as u32).collect();
-        // K_SPLIT == 1 keeps k in one reduction, so gather and dense share the exact accumulation.
-        check_gather!(m, vocab, ids, ids_per_row, 0.05, |B| {
-            let context = <B as Backend>::Context::new().expect("context");
-            let buffers = QuantBuffers::<B, bf16>::allocate(&context, &input);
-            let ids_alloc = alloc_allocation_with_data::<B, u32>(&context, &ids);
-            let variant =
-                || quant_b_variant(&buffers.w, &buffers.scales, buffers.zp.as_ref(), buffers.bias.as_ref(), &input);
-            (
-                run_gemv::<B, bf16>(&context, &buffers.x, variant(), None, m, vocab, k, None),
-                run_gemv::<B, bf16>(&context, &buffers.x, variant(), Some(&ids_alloc), m, ids_per_row, k, None),
-            )
-        });
+    for bits in [4, 8] {
+        let aligned_k = if bits == 4 {
+            512
+        } else {
+            256
+        };
+        for k in [aligned_k, aligned_k + 16] {
+            for method in
+                [QuantizationMethod::ScaleBias, QuantizationMethod::ScaleZeroPoint, QuantizationMethod::ScaleSymmetric]
+            {
+                for ids_per_row in [5usize, 6, 7] {
+                    let (m, vocab, group_size) = (2usize, 13usize, 32u32);
+                    let input =
+                        QuantInput::<bf16>::new(m as u32, k as u32, vocab as u32, group_size, bits, method, 0x5EED);
+                    let physical_rows = [12, 1, 8, 1, 5, 10, 3];
+                    let ids: Vec<u32> = (0..m)
+                        .flat_map(|input_row| {
+                            (0..ids_per_row).map(move |readout_row| {
+                                physical_rows[(ids_per_row - readout_row - 1 + input_row) % ids_per_row] as u32
+                            })
+                        })
+                        .collect();
+                    check_gather!(m, vocab, ids, ids_per_row, 0.05, |B| {
+                        let context = <B as Backend>::Context::new().expect("context");
+                        let buffers = QuantBuffers::<B, bf16>::allocate(&context, &input);
+                        let ids_alloc = alloc_allocation_with_data::<B, u32>(&context, &ids);
+                        let variant = || {
+                            quant_b_variant(
+                                &buffers.w,
+                                &buffers.scales,
+                                buffers.zp.as_ref(),
+                                buffers.bias.as_ref(),
+                                &input,
+                            )
+                        };
+                        (
+                            run_gemv::<B, bf16>(&context, &buffers.x, variant(), None, m, vocab, k, None),
+                            run_gemv::<B, bf16>(
+                                &context,
+                                &buffers.x,
+                                variant(),
+                                Some(&ids_alloc),
+                                m,
+                                ids_per_row,
+                                k,
+                                None,
+                            ),
+                        )
+                    });
+                }
+            }
+        }
     }
 }

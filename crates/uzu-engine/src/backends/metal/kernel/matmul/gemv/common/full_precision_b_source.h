@@ -25,8 +25,10 @@ struct FullPrecisionBSource {
     const uint k_start = tile.k_slice * BLOCK_SIZE;
     const uint thread_k = tile.reduction_lane * VALUES_PER_THREAD + k_start;
     const uint weights_row_stride = params.in_vec_size;
-    const uint input_row = tile.input_row;
-    const device AT* input = ops.a + input_row * params.in_vec_size + thread_k;
+    const uint route = tile.input_row;
+    const uint source_row = input_row(params, route);
+    const uint matrix = matrix_index(ops, params, route);
+    const device AT* input = ops.a + source_row * params.in_vec_size + thread_k;
     thread const device BT* weight_rows[Tile::ROWS_PER_LANE];
     const uint last_row = params.out_vec_size > 0 ? params.out_vec_size - 1 : 0;
 
@@ -35,9 +37,10 @@ struct FullPrecisionBSource {
       const uint global_row = tile.row0 + output_index;
       const uint lookup_row = FULL_TILE ? global_row : min(global_row, last_row);
       const uint weight_row =
-          params.gathered ? ops.gather_indices[input_row * params.out_vec_size + lookup_row] : lookup_row;
+          params.gathered ? ops.gather_indices[route * params.out_vec_size + lookup_row] : lookup_row;
+      const uint bank_row = matrix * params.out_vec_size + weight_row;
       weight_rows[output_index] =
-          reinterpret_cast<const device BT*>(ops.b) + weight_row * weights_row_stride + thread_k;
+          reinterpret_cast<const device BT*>(ops.b) + bank_row * weights_row_stride + thread_k;
     }
 
     uint k = k_start;

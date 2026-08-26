@@ -147,7 +147,9 @@ fn quant_shape(
         b_group_size: Some(32),
         signed_codes: false,
         a_full_precision: true,
-        gathered: false,
+        sparse_readout: false,
+        expert_routed: false,
+        expert_bias: false,
         d_transform,
     }
 }
@@ -167,7 +169,9 @@ fn block_unaligned_quantized_k_stays_on_gemv() {
         b_group_size: Some(64),
         signed_codes: false,
         a_full_precision: true,
-        gathered: false,
+        sparse_readout: false,
+        expert_routed: false,
+        expert_bias: false,
         d_transform: GemmDTransform::empty(),
     };
     assert!(

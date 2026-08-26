@@ -1,11 +1,21 @@
 use crate::backends::common::{Allocation, Backend, gpu_types::gemm::GemmDTransform};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateActMulDOps {
+    pub activation_alpha: Option<f32>,
+    pub gate_clipping: Option<(f32, f32)>,
+    pub value_clipping: Option<(f32, f32)>,
+}
+
 pub struct MatmulDOps<'a, B: Backend> {
     pub ab_scale: f32,
     pub accumulate: bool,
     pub bias: Option<&'a Allocation<B>>,
+    /// `[matrix_count, N]` biases selected by expert route.
+    pub per_matrix_bias: Option<&'a Allocation<B>>,
     pub rht_factors: Option<&'a Allocation<B>>,
     pub soft_cap: Option<f32>,
+    pub gate_act: Option<GateActMulDOps>,
 }
 
 impl<'a, B: Backend> MatmulDOps<'a, B> {
@@ -14,8 +24,10 @@ impl<'a, B: Backend> MatmulDOps<'a, B> {
             ab_scale: 1.0,
             accumulate: false,
             bias: None,
+            per_matrix_bias: None,
             rht_factors: None,
             soft_cap: None,
+            gate_act: None,
         }
     }
 
@@ -35,6 +47,9 @@ impl<'a, B: Backend> MatmulDOps<'a, B> {
         }
         if self.soft_cap.is_some() {
             m |= GemmDTransform::SOFT_CAP;
+        }
+        if self.gate_act.is_some() {
+            m |= GemmDTransform::GATE_ACT_MUL;
         }
         m
     }
@@ -59,6 +74,11 @@ impl<'a, B: Backend> MatmulDOps<'a, B> {
             } else {
                 self.bias
             },
+            per_matrix_bias: if bits.contains(GemmDTransform::BIAS) {
+                None
+            } else {
+                self.per_matrix_bias
+            },
             rht_factors: if bits.contains(GemmDTransform::RHT) {
                 None
             } else {
@@ -68,6 +88,11 @@ impl<'a, B: Backend> MatmulDOps<'a, B> {
                 None
             } else {
                 self.soft_cap
+            },
+            gate_act: if bits.contains(GemmDTransform::GATE_ACT_MUL) {
+                None
+            } else {
+                self.gate_act
             },
         }
     }

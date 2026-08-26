@@ -150,7 +150,7 @@ impl GemmKernel {
             .validate_engine(plan.engine)
             .map_err(|error| MetalError::KernelDispatchFailed(Box::new(error)))?;
 
-        let is_quant = shape.is_quant();
+        let is_quant = shape.is_integer_quantized();
         if is_quant {
             let d_mask = arguments.d_transform.mask();
             if d_mask.contains(GemmDTransform::ACCUMULATE) {

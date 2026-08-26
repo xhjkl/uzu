@@ -134,15 +134,22 @@ KERNEL(Gemv)(
     const device int32_t* hadamard_factors
         OPTIONAL(output_transform.contains(GemmDTransform::RHT)),
     const device uint* gather_indices OPTIONAL(gathered),
+    const device int* expert_ids OPTIONAL(expert_routed),
+    const device BT* expert_biases OPTIONAL(expert_bias),
     const constant uint& in_vec_size,
     const constant uint& out_vec_size,
     const constant uint& batch_size,
     const constant float& ab_scale,
     const constant uint& group_count_x,
+    const constant uint& routes_per_token,
+    const constant uint& expert_count,
+    const constant bool& input_is_route_major,
     const constant float& soft_cap
         OPTIONAL(output_transform.contains(GemmDTransform::SOFT_CAP)),
     const GemmDTransform output_transform SPECIALIZE,
     const bool gathered SPECIALIZE,
+    const bool expert_routed SPECIALIZE,
+    const bool expert_bias SPECIALIZE,
     const bool signed_codes SPECIALIZE,
     const bool full_tile SPECIALIZE,
     threadgroup float shared_results[INPUT_ROW_TILE * OUTPUT_ROW_TILE * K_SPLIT],
@@ -152,9 +159,35 @@ KERNEL(Gemv)(
     const uint simd_group THREADS(NUM_SIMDGROUPS)
 ) {
   using Ops = GemvOperands<AT, BT, DT>;
-  const Ops ops = {b, scales, zero_points, biases, outer_scales, a, d, output_bias, hadamard_factors, gather_indices};
-  const GemvParams params =
-      {in_vec_size, out_vec_size, batch_size, ab_scale, soft_cap, output_transform, gathered, signed_codes};
+  const Ops ops = {
+      b,
+      scales,
+      zero_points,
+      biases,
+      outer_scales,
+      a,
+      d,
+      output_bias,
+      hadamard_factors,
+      gather_indices,
+      expert_ids,
+      expert_biases,
+  };
+  const GemvParams params = {
+      in_vec_size,
+      out_vec_size,
+      batch_size,
+      ab_scale,
+      soft_cap,
+      output_transform,
+      gathered,
+      expert_routed,
+      expert_bias,
+      signed_codes,
+      routes_per_token,
+      expert_count,
+      input_is_route_major,
+  };
   dispatch_bool(full_tile, [&](auto full_tile_constant) {
     constexpr bool FullTile = decltype(full_tile_constant)::value;
     using Tile = GemvTile<INPUT_ROW_TILE, OUTPUT_ROW_TILE, REDUCTION_LANES, GROUP_LANES, NUM_SIMDGROUPS, K_SPLIT>;

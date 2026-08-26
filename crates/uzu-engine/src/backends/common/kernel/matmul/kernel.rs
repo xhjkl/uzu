@@ -40,4 +40,11 @@ pub trait MatmulKernel: Sized + Send + Sync {
     ) -> ActivationFormat {
         ActivationFormat::Bf16
     }
+
+    fn supports_fused_gate_act(
+        &self,
+        _shape: &MatmulShape,
+    ) -> bool {
+        false
+    }
 }

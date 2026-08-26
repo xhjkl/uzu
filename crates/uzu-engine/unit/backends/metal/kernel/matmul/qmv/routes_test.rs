@@ -12,7 +12,11 @@ use crate::{
         },
         metal::{
             device_profile::{DeviceIdentity, DeviceProfile, DeviceSize},
-            kernel::matmul::{MatmulDispatch, MatmulMetalKernel, gemm::GemmProblem, gemv::GemvSpecialization},
+            kernel::matmul::{
+                MatmulDispatch, MatmulMetalKernel,
+                gemm::GemmProblem,
+                gemv::{GemvPlan, GemvSpecialization},
+            },
         },
     },
     data_type::DataType,
@@ -65,7 +69,9 @@ fn problem(
         b_group_size: Some(group),
         signed_codes: false,
         a_full_precision: true,
-        gathered: false,
+        sparse_readout: false,
+        expert_routed: false,
+        expert_bias: false,
         d_transform: GemmDTransform::empty(),
     }
 }
@@ -108,6 +114,8 @@ fn table_is_complete_and_fingerprint_is_stable() {
                     assert_eq!(route(profile, &problem, true), Some(selected));
                     let runtime = MatmulMetalKernel::choose_dispatch(
                         &problem,
+                        1.0,
+                        None,
                         profile,
                         profile.supports_mxu(),
                         DataType::BF16,
@@ -124,7 +132,9 @@ fn table_is_complete_and_fingerprint_is_stable() {
                         )
                         .expect("stored GEMV tile must be legal");
                         assert_eq!(specialization.tile(), tile);
-                        assert!(matches!(runtime, MatmulDispatch::Gemv(actual) if actual == specialization));
+                        assert!(
+                            matches!(runtime, MatmulDispatch::Gemv(GemvPlan::Generic(actual)) if actual == specialization)
+                        );
                     } else if let QmvRoute::MainGemm(plan) = selected {
                         let problem =
                             GemmProblem::new(problem, DataType::BF16, DataType::BF16, profile.supports_mxu(), profile);
@@ -170,7 +180,7 @@ fn exact_lookup_rejects_non_matrix_inputs() {
         |p: &mut MatmulShape| p.m = 1,
         |p: &mut MatmulShape| p.n = 1,
         |p: &mut MatmulShape| p.b_bits = Some(8),
-        |p: &mut MatmulShape| p.gathered = true,
+        |p: &mut MatmulShape| p.sparse_readout = true,
     ] {
         let mut rejected = p;
         mutate(&mut rejected);
@@ -207,13 +217,15 @@ fn normal_routing_handles_inputs_outside_the_frozen_matrix() {
         assert!(matches!(
             MatmulMetalKernel::choose_dispatch(
                 &problem,
+                1.0,
+                None,
                 profile,
                 false,
                 DataType::BF16,
                 DataType::BF16,
                 DataType::BF16,
             ),
-            MatmulDispatch::Gemv(actual) if actual == specialization
+            MatmulDispatch::Gemv(GemvPlan::Generic(actual)) if actual == specialization
         ));
     }
 }

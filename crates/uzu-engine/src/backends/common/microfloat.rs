@@ -20,7 +20,7 @@ pub enum MicrofloatError {
         format: MicrofloatFormat,
         group_size: u32,
     },
-    #[error("microfloat rows and columns must be nonzero")]
+    #[error("microfloat matrix count, rows, and columns must be nonzero")]
     EmptyShape,
     #[error("microfloat columns {columns} are not divisible by group size {group_size}")]
     MisalignedColumns {
@@ -78,10 +78,11 @@ impl MicrofloatEncoding {
     }
 }
 
-/// Physical shape and derived strides for one microfloat matrix.
+/// Physical shape and derived strides for a microfloat matrix bank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MicrofloatMetadata {
     encoding: MicrofloatEncoding,
+    matrix_count: u32,
     rows: u32,
     columns: u32,
 }
@@ -89,10 +90,11 @@ pub struct MicrofloatMetadata {
 impl MicrofloatMetadata {
     pub fn new(
         encoding: MicrofloatEncoding,
+        matrix_count: u32,
         rows: u32,
         columns: u32,
     ) -> Result<Self, MicrofloatError> {
-        if rows == 0 || columns == 0 {
+        if matrix_count == 0 || rows == 0 || columns == 0 {
             return Err(MicrofloatError::EmptyShape);
         }
         let group_size = encoding.group_size();
@@ -104,6 +106,7 @@ impl MicrofloatMetadata {
         }
         let metadata = Self {
             encoding,
+            matrix_count,
             rows,
             columns,
         };
@@ -128,6 +131,10 @@ impl MicrofloatMetadata {
         self.rows
     }
 
+    pub fn matrix_count(self) -> u32 {
+        self.matrix_count
+    }
+
     pub fn columns(self) -> u32 {
         self.columns
     }
@@ -150,18 +157,26 @@ impl MicrofloatMetadata {
 
     pub fn required_code_bytes(self) -> usize {
         self.code_matrix_stride()
+            .checked_mul(self.matrix_count as usize)
+            .expect("MicrofloatMetadata validates code storage size")
     }
 
     pub fn required_scale_bytes(self) -> usize {
         self.scale_matrix_stride()
+            .checked_mul(self.matrix_count as usize)
+            .expect("MicrofloatMetadata validates scale storage size")
     }
 
     fn checked_code_matrix_stride(self) -> Option<usize> {
-        (self.rows as usize).checked_mul(self.code_row_stride())
+        (self.rows as usize)
+            .checked_mul(self.code_row_stride())
+            .filter(|stride| stride.checked_mul(self.matrix_count as usize).is_some())
     }
 
     fn checked_scale_matrix_stride(self) -> Option<usize> {
-        (self.rows as usize).checked_mul(self.scale_row_stride())
+        (self.rows as usize)
+            .checked_mul(self.scale_row_stride())
+            .filter(|stride| stride.checked_mul(self.matrix_count as usize).is_some())
     }
 }
 
@@ -212,9 +227,9 @@ mod tests {
         for group_size in [16, 32] {
             let encoding =
                 MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 4, group_size).expect("supported MXFP4 encoding");
-            let metadata = MicrofloatMetadata::new(encoding, 3, 32).expect("supported MXFP4 metadata");
-            assert_eq!(metadata.required_code_bytes(), 48);
-            assert_eq!(metadata.required_scale_bytes(), 3 * 32 / group_size as usize);
+            let metadata = MicrofloatMetadata::new(encoding, 2, 3, 32).expect("supported MXFP4 metadata");
+            assert_eq!(metadata.required_code_bytes(), 96);
+            assert_eq!(metadata.required_scale_bytes(), 2 * 3 * 32 / group_size as usize);
         }
         assert!(matches!(
             MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 8, 16),

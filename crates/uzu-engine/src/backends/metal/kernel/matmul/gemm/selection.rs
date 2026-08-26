@@ -146,7 +146,7 @@ impl GemmProblem {
         if shape.b_kind == MatmulBKind::Mxfp4 {
             return 1;
         }
-        let splittable = shape.is_quant() || (shape.b_transpose && shape.b_leading_dimension.is_none());
+        let splittable = shape.is_integer_quantized() || (shape.b_transpose && shape.b_leading_dimension.is_none());
         if !splittable || !self.split_k_output_supported() {
             return 1;
         }
@@ -158,7 +158,7 @@ impl GemmProblem {
             return 1;
         };
         let group_size = shape.b_group_size.unwrap_or(0);
-        let mut align = if engine == GemmEngine::Mxu || !shape.is_quant() {
+        let mut align = if engine == GemmEngine::Mxu || !shape.is_integer_quantized() {
             step
         } else {
             step.max(group_size)
@@ -182,7 +182,7 @@ impl GemmProblem {
         use crate::backends::common::gpu_types::gemm::GemmDTransform;
 
         let mut output_transform = self.shape.d_transform;
-        if self.shape.is_quant()
+        if self.shape.is_integer_quantized()
             && output_transform.contains(GemmDTransform::RHT)
             && output_transform.contains(GemmDTransform::BIAS)
         {
@@ -198,7 +198,7 @@ pub(super) fn outer_block_k(
     engine: GemmEngine,
     tiling: GemmTiling,
 ) -> Option<u32> {
-    if engine == GemmEngine::Mxu && shape.is_quant() {
+    if engine == GemmEngine::Mxu && shape.is_integer_quantized() {
         shape.b_group_size.filter(|&group_size| group_size != 0)
     } else {
         Some(tiling.block_k()).filter(|&block_k| block_k != 0)

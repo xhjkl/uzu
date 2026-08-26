@@ -2,11 +2,12 @@ use super::policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK};
 use crate::{
     backends::{
         common::{
+            Buffer, BufferArg, Encoder,
             gpu_types::{
                 HADAMARD_TRANSFORM_BLOCK_SIZE,
                 gemm::{GemmBPrologueKind, GemmDTransform},
             },
-            kernel::matmul::MatmulShape,
+            kernel::matmul::{ExpertInput, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
         },
         metal::{context::MetalContext, device_profile::DeviceProfile, error::MetalError, kernel::GemvMetalKernel},
     },
@@ -14,6 +15,30 @@ use crate::{
 };
 
 const GEMV_MAX_BATCH: u32 = 8;
+
+#[derive(Clone, Copy)]
+struct GemvBufferSlice<'a> {
+    buffer: &'a dyn Buffer<Backend = Metal>,
+    offset: usize,
+    length: usize,
+}
+
+impl<'a> GemvBufferSlice<'a> {
+    fn new(argument: impl BufferArg<'a, Metal>) -> Self {
+        let (buffer, offset, length) = argument.into_parts();
+        Self {
+            buffer,
+            offset,
+            length,
+        }
+    }
+}
+
+impl<'a> BufferArg<'a, Metal> for GemvBufferSlice<'a> {
+    fn into_parts(self) -> (&'a dyn Buffer<Backend = Metal>, usize, usize) {
+        (self.buffer, self.offset, self.length)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemvSpecialization {
@@ -30,6 +55,8 @@ pub struct GemvSpecialization {
     group_lanes: u32,
     microfloat: bool,
     gathered: bool,
+    expert_routed: bool,
+    expert_bias: bool,
     signed_codes: bool,
     full_tile: bool,
 }
@@ -54,12 +81,12 @@ impl GemvSpecialization {
         output_data_type: DataType,
         device_profile: DeviceProfile,
     ) -> Option<Self> {
-        let is_quant = shape.is_quant();
+        let integer_quantized = shape.is_integer_quantized();
         let bits = shape.b_bits.unwrap_or(0);
         let bf16_io = input_data_type == DataType::BF16 && output_data_type == DataType::BF16;
-        let tile = if is_quant && shape.gathered {
+        let tile = if integer_quantized && shape.sparse_readout {
             policy::gathered_tile(bits, shape.b_group_size.unwrap_or(0), shape.m, shape.n)
-        } else if is_quant {
+        } else if integer_quantized {
             policy::quantized_tile(
                 device_profile,
                 bits,
@@ -102,7 +129,7 @@ impl GemvSpecialization {
         input_data_type: DataType,
         output_data_type: DataType,
     ) -> Option<Self> {
-        if shape.m > GEMV_MAX_BATCH && !shape.gathered {
+        if shape.m > GEMV_MAX_BATCH && !shape.sparse_readout {
             return None;
         }
         Self::select_tile_for_format(
@@ -126,8 +153,8 @@ impl GemvSpecialization {
         if !shape.b_transpose || !shape.a_full_precision {
             return None;
         }
-        let is_quant = shape.is_quant();
-        let bad_leading_dimension = if is_quant || microfloat {
+        let integer_quantized = shape.is_integer_quantized();
+        let bad_leading_dimension = if integer_quantized || microfloat {
             shape.b_leading_dimension.is_some()
         } else {
             shape.b_leading_dimension.is_some_and(|ld| ld != shape.k)
@@ -142,7 +169,7 @@ impl GemvSpecialization {
             return None;
         }
         let bits = shape.b_bits.unwrap_or(0);
-        if !is_quant && !microfloat {
+        if !integer_quantized && !microfloat {
             let mixed_precision = weights_data_type == DataType::F32
                 && (input_data_type != DataType::F32 || output_data_type != DataType::F32);
             if mixed_precision || shape.n < DEFAULT_RESULTS_PER_SIMDGROUP || shape.m > GEMV_MAX_BATCH {
@@ -151,7 +178,7 @@ impl GemvSpecialization {
         }
         let block_size = if microfloat {
             shape.b_group_size.unwrap_or(FP_K_BLOCK)
-        } else if !is_quant {
+        } else if !integer_quantized {
             FP_K_BLOCK
         } else if bits == 4 {
             512
@@ -159,7 +186,7 @@ impl GemvSpecialization {
             256
         };
         let input_aligned = shape.k.is_multiple_of(block_size);
-        if (is_quant && shape.gathered || microfloat) && tile.input_row_tile > 1 {
+        if (shape.sparse_readout || shape.expert_routed || microfloat) && tile.input_row_tile > 1 {
             return None;
         }
         let specialization = Self {
@@ -175,7 +202,9 @@ impl GemvSpecialization {
             reduction_lanes: tile.reduction_lanes,
             group_lanes: tile.group_lanes,
             microfloat,
-            gathered: shape.gathered,
+            gathered: shape.sparse_readout,
+            expert_routed: shape.expert_routed,
+            expert_bias: shape.expert_bias,
             signed_codes: shape.signed_codes,
             full_tile: full_tile(shape, tile),
         };
@@ -211,6 +240,8 @@ impl GemvSpecialization {
             self.microfloat,
             self.output_transform,
             self.gathered,
+            self.expert_routed,
+            self.expert_bias,
             self.signed_codes,
             self.full_tile,
         )
@@ -225,14 +256,6 @@ fn full_tile(
 }
 
 use std::collections::{HashMap, hash_map::Entry};
-
-use crate::backends::{
-    common::{
-        BufferArg, Encoder,
-        kernel::matmul::{MatmulA, MatmulArguments, MatmulB, MatmulError},
-    },
-    metal::Metal,
-};
 
 /// GEMV pipelines compiled on first use.
 pub struct GemvKernel {
@@ -278,8 +301,15 @@ impl GemvKernel {
         specialization: GemvSpecialization,
         encoder: &mut Encoder<Metal>,
     ) -> Result<(), MatmulError<Metal>> {
+        if arguments.d_transform.gate_act.is_some() {
+            return Err(MatmulError::UnsupportedDOp {
+                bit: GemmDTransform::GATE_ACT_MUL,
+                path: "Gemv",
+            });
+        }
         let ab_scale = arguments.d_transform.ab_scale;
         let output_bias = arguments.d_transform.bias;
+        let per_matrix_bias = arguments.d_transform.per_matrix_bias;
         let rht_factors = arguments.d_transform.rht_factors;
         let soft_cap = arguments.d_transform.soft_cap;
 
@@ -290,7 +320,7 @@ impl GemvKernel {
             m,
             n,
             k,
-            gather_indices,
+            routing,
             ..
         } = arguments;
         let MatmulA::FullPrecision {
@@ -304,111 +334,89 @@ impl GemvKernel {
             });
         };
 
-        // Preserve each weight buffer's residency range.
-        let (scales, zero_points, biases, outer_scales) = match &b {
+        let gather_indices = routing.sparse_readout_rows();
+        let (expert_ids, routes_per_token, expert_count, input_is_route_major) = match routing.expert_routes() {
+            Some(routes) => (
+                Some(routes.expert_ids),
+                routes.routes_per_token.get(),
+                routes.expert_count.get(),
+                routes.input == ExpertInput::Routes,
+            ),
+            None => (None, 1, 1, false),
+        };
+        let (weights, scales, zero_points, biases, outer_scales) = match b {
             MatmulB::FullPrecision {
-                ..
-            } => (None, None, None, None),
+                b,
+            } => (GemvBufferSlice::new(b), None, None, None, None),
             MatmulB::Microfloat {
+                codes,
                 scales,
                 outer_scales,
                 ..
-            } => (Some(*scales), None, None, Some(*outer_scales)),
+            } => (
+                GemvBufferSlice::new(codes),
+                Some(GemvBufferSlice::new(scales)),
+                None,
+                None,
+                Some(GemvBufferSlice::new(outer_scales)),
+            ),
             MatmulB::ScaleBiasDequant {
+                b,
                 scales,
                 biases,
                 ..
-            } => (Some(*scales), None, Some(*biases), None),
+            } => (
+                GemvBufferSlice::new(b),
+                Some(GemvBufferSlice::new(scales)),
+                None,
+                Some(GemvBufferSlice::new(biases)),
+                None,
+            ),
             MatmulB::ScaleZeroPointDequant {
+                b,
                 scales,
                 zero_points,
                 ..
-            } => (Some(*scales), Some(*zero_points), None, None),
+            } => (
+                GemvBufferSlice::new(b),
+                Some(GemvBufferSlice::new(scales)),
+                Some(GemvBufferSlice::new(zero_points)),
+                None,
+                None,
+            ),
             MatmulB::ScaleSymmetricDequant {
+                b,
                 scales,
                 ..
-            } => (Some(*scales), None, None, None),
+            } => (GemvBufferSlice::new(b), Some(GemvBufferSlice::new(scales)), None, None, None),
         };
 
         let output_group_count = n.div_ceil(specialization.output_row_tile());
-        let context = encoder.context();
-        let pipeline = self.get_or_create(context, specialization)?;
-        match b {
-            MatmulB::Microfloat {
-                codes: weights,
-                ..
-            } => pipeline.encode(
-                weights,
-                scales,
-                zero_points,
-                biases,
-                outer_scales,
-                (a, a_offset),
-                &mut *d,
-                output_bias,
-                rht_factors,
-                gather_indices,
-                k,
-                n,
-                m,
-                ab_scale,
-                output_group_count,
-                soft_cap,
-                encoder,
-            ),
-            MatmulB::FullPrecision {
-                b: weights,
-            } => pipeline.encode(
-                weights,
-                scales,
-                zero_points,
-                biases,
-                outer_scales,
-                (a, a_offset),
-                &mut *d,
-                output_bias,
-                rht_factors,
-                gather_indices,
-                k,
-                n,
-                m,
-                ab_scale,
-                output_group_count,
-                soft_cap,
-                encoder,
-            ),
-            MatmulB::ScaleBiasDequant {
-                b: weights,
-                ..
-            }
-            | MatmulB::ScaleZeroPointDequant {
-                b: weights,
-                ..
-            }
-            | MatmulB::ScaleSymmetricDequant {
-                b: weights,
-                ..
-            } => pipeline.encode(
-                weights,
-                scales,
-                zero_points,
-                biases,
-                outer_scales,
-                (a, a_offset),
-                &mut *d,
-                output_bias,
-                rht_factors,
-                gather_indices,
-                k,
-                n,
-                m,
-                ab_scale,
-                output_group_count,
-                soft_cap,
-                encoder,
-            ),
-        }
-
+        let pipeline = self.get_or_create(encoder.context(), specialization)?;
+        pipeline.encode(
+            weights,
+            scales,
+            zero_points,
+            biases,
+            outer_scales,
+            (a, a_offset),
+            &mut *d,
+            output_bias,
+            rht_factors,
+            gather_indices,
+            expert_ids,
+            per_matrix_bias,
+            k,
+            n,
+            m,
+            ab_scale,
+            output_group_count,
+            routes_per_token,
+            expert_count,
+            input_is_route_major,
+            soft_cap,
+            encoder,
+        );
         Ok(())
     }
 }

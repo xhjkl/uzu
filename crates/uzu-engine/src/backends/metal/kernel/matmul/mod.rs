@@ -16,8 +16,8 @@ use crate::{
             kernel::{
                 activation_transform::ACTIVATION_SCALE_GROUP_SIZE,
                 matmul::{
-                    A8ActivationPlan, ActivationFormat, MatmulArguments, MatmulB, MatmulBKind, MatmulError,
-                    MatmulKernel, MatmulShape,
+                    A8ActivationPlan, ActivationFormat, MatmulArguments, MatmulBKind, MatmulError, MatmulKernel,
+                    MatmulShape, validate_matmul_arguments,
                 },
             },
         },
@@ -47,7 +47,11 @@ impl MatmulMetalKernel {
         input_data_type: DataType,
         output_data_type: DataType,
     ) -> bool {
-        if shape.gathered || plan.engine != gemm::GemmEngine::Mxu {
+        if shape.sparse_readout
+            || shape.expert_routed
+            || shape.b_kind == MatmulBKind::Mxfp4
+            || plan.engine != gemm::GemmEngine::Mxu
+        {
             return false;
         }
         match (shape.m, shape.n == shape.k, (weights_data_type, input_data_type, output_data_type)) {
@@ -163,7 +167,7 @@ impl MatmulKernel for MatmulMetalKernel {
             || self.input_data_type != DataType::BF16
             || self.output_data_type != DataType::BF16
             || shape.a_full_precision
-            || !shape.is_quant()
+            || !shape.is_integer_quantized()
             || !shape.signed_codes
             || !shape.b_transpose
             || shape.b_leading_dimension.is_some()
@@ -212,26 +216,14 @@ impl MatmulKernel for MatmulMetalKernel {
         arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
         encoder: &mut Encoder<Metal>,
     ) -> Result<(), MetalError> {
+        validate_matmul_arguments(
+            &arguments,
+            self.weights_data_type,
+            self.input_data_type,
+            self.output_data_type,
+            "MetalMatmul",
+        )?;
         let shape = MatmulShape::from_arguments(&arguments);
-        if let MatmulB::Microfloat {
-            codes,
-            scales,
-            outer_scales,
-            metadata,
-        } = &arguments.b
-        {
-            let rows_match = arguments.gather_indices.is_some() || metadata.rows() == arguments.n;
-            if !arguments.b_transpose
-                || arguments.b_leading_dimension.is_some()
-                || !rows_match
-                || metadata.columns() != arguments.k
-                || codes.size() < metadata.required_code_bytes()
-                || scales.size() < metadata.required_scale_bytes()
-                || outer_scales.size() < self.weights_data_type.size_in_bytes()
-            {
-                return Err(MatmulError::InvalidMicrofloatStorage.into());
-            }
-        }
         let plan = match self.select_dispatch(&shape, encoder.context()) {
             MatmulDispatch::Gemv(gemv) => {
                 return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from);
@@ -240,10 +232,19 @@ impl MatmulKernel for MatmulMetalKernel {
         };
 
         // TODO: remove after GatherGEMM is supported
-        if arguments.gather_indices.is_some() {
+        if arguments.routing.sparse_readout_rows().is_some() {
             return Err(MetalError::KernelDispatchFailed(
                 format!(
                     "gathered readout requires the GEMV path, but shape (m={}, n={}) routes to GEMM",
+                    arguments.m, arguments.n
+                )
+                .into(),
+            ));
+        }
+        if arguments.routing.expert_routes().is_some() {
+            return Err(MetalError::KernelDispatchFailed(
+                format!(
+                    "expert routing requires the GEMV path, but shape (m={}, n={}) routes to GEMM",
                     arguments.m, arguments.n
                 )
                 .into(),

@@ -381,7 +381,8 @@ pub fn route(
         || !shape.a_full_precision
         || !shape.b_transpose
         || shape.b_leading_dimension.is_some()
-        || shape.gathered
+        || shape.sparse_readout
+        || shape.expert_routed
     {
         return None;
     }

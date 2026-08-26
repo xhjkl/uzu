@@ -9,7 +9,7 @@ use crate::{
     backends::{
         common::{
             Backend, Context, Encoder, Kernels,
-            kernel::matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel},
+            kernel::matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting},
             microfloat::{MicrofloatEncoding, MicrofloatFormat, MicrofloatMetadata, decode_mxfp4},
         },
         cpu::Cpu,
@@ -72,7 +72,7 @@ fn execute_mxfp4<B: Backend, T: ArrayElement + Float>(case: Mxfp4Case) -> Vec<T>
     } = case;
     let encoding =
         MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 4, group_size as u32).expect("valid MXFP4 encoding");
-    let metadata = MicrofloatMetadata::new(encoding, n as u32, k as u32).expect("valid dense MXFP4 metadata");
+    let metadata = MicrofloatMetadata::new(encoding, 1, n as u32, k as u32).expect("valid dense MXFP4 metadata");
     let context = B::Context::new().expect("create backend context");
     let input_values: Vec<T> =
         (0..m * k).map(|index| T::from(uniform_input.unwrap_or((index % 13) as f32 * 0.125 - 0.5)).unwrap()).collect();
@@ -107,6 +107,7 @@ fn execute_mxfp4<B: Backend, T: ArrayElement + Float>(case: Mxfp4Case) -> Vec<T>
             bias: Some(&bias),
             rht_factors: None,
             soft_cap: Some(2.0),
+            ..MatmulDOps::none()
         },
     };
     kernel
@@ -126,7 +127,7 @@ fn execute_mxfp4<B: Backend, T: ArrayElement + Float>(case: Mxfp4Case) -> Vec<T>
                 b_transpose: true,
                 d: &mut output,
                 d_transform,
-                gather_indices: None,
+                routing: MatmulRouting::Dense,
                 m: m as u32,
                 n: n as u32,
                 k: k as u32,
@@ -148,7 +149,8 @@ fn cpu_executes_dense_mxfp4_matmul() {
             let outer_scales = [1.25f32];
             let encoding =
                 MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 4, group_size as u32).expect("valid MXFP4 encoding");
-            let metadata = MicrofloatMetadata::new(encoding, N as u32, K as u32).expect("valid dense MXFP4 metadata");
+            let metadata =
+                MicrofloatMetadata::new(encoding, 1, N as u32, K as u32).expect("valid dense MXFP4 metadata");
 
             let context = <Cpu as Backend>::Context::new().expect("create CPU context");
             let input = alloc_allocation_with_data::<Cpu, f32>(context.as_ref(), &input_values);
@@ -181,7 +183,7 @@ fn cpu_executes_dense_mxfp4_matmul() {
                         b_transpose: true,
                         d: &mut output,
                         d_transform: MatmulDOps::none(),
-                        gather_indices: None,
+                        routing: MatmulRouting::Dense,
                         m: row_count as u32,
                         n: N as u32,
                         k: K as u32,

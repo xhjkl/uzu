@@ -102,10 +102,11 @@ public:
         const uint source_row = FULL_TILE ? I : min(I, batch_remaining - 1);
         const uint k =
             position.group * GROUP_SIZE + group_offset + position.slice * SLICE_VALUES + chunk * CHUNK_VALUES;
-        const uint input_row = tile.input_row + source_row;
-        const device AT* input = ops.a + input_row * params.in_vec_size + k;
+        const uint route = tile.input_row + source_row;
+        const uint activation_row = input_row(params, route);
+        const device AT* input = ops.a + activation_row * params.in_vec_size + k;
         float input_values[CHUNK_VALUES];
-        QuantChunk<BITS>::template load<INPUT_ALIGNED>(input, input_values, k, params.in_vec_size, input_row);
+        QuantChunk<BITS>::template load<INPUT_ALIGNED>(input, input_values, k, params.in_vec_size, activation_row);
         if constexpr (B_PROLOGUE == GemmBPrologueKind::ScaleBiasDequant) {
           METAL_PRAGMA_UNROLL
           for (uint i = 0; i < CHUNK_VALUES; i++) {

@@ -6,7 +6,7 @@ use crate::{
             Allocation, BufferArg, Encoder, Kernels,
             kernel::{
                 AttentionArguments, AttentionKernelConfig, SoftmaxKernel,
-                matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel},
+                matmul::{MatmulA, MatmulArguments, MatmulB, MatmulDOps, MatmulKernel, MatmulRouting},
             },
         },
         metal::{
@@ -116,7 +116,7 @@ impl AttentionFallback {
                         ab_scale: scale,
                         ..MatmulDOps::none()
                     },
-                    gather_indices: None,
+                    routing: MatmulRouting::Dense,
                     m: gqa_factor * suffix_length,
                     n: sequence_length,
                     k: self.head_dim,
@@ -155,7 +155,7 @@ impl AttentionFallback {
                     b_transpose: false,
                     d: &mut group_output,
                     d_transform: MatmulDOps::none(),
-                    gather_indices: None,
+                    routing: MatmulRouting::Dense,
                     m: gqa_factor * suffix_length,
                     n: self.head_dim,
                     k: sequence_length,

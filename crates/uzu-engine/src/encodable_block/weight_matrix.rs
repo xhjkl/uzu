@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use thiserror::Error;
 
 use crate::{
@@ -141,6 +143,31 @@ impl<B: Backend> WeightMatrix<B> {
         input_dim: u32,
         data_type: DataType,
     ) -> Result<Self, WeightMatrixError<B>> {
+        Self::load_impl(tree, spec, required_layout, None, output_dim, input_dim, data_type)
+    }
+
+    pub fn load_bank(
+        tree: &ParameterTree<B>,
+        spec: AnyWeightMatrixSpec,
+        required_layout: Layout,
+        matrix_count: NonZeroU32,
+        output_dim: u32,
+        input_dim: u32,
+        data_type: DataType,
+    ) -> Result<Self, WeightMatrixError<B>> {
+        Self::load_impl(tree, spec, required_layout, Some(matrix_count), output_dim, input_dim, data_type)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_impl(
+        tree: &ParameterTree<B>,
+        spec: AnyWeightMatrixSpec,
+        required_layout: Layout,
+        matrix_count: Option<NonZeroU32>,
+        output_dim: u32,
+        input_dim: u32,
+        data_type: DataType,
+    ) -> Result<Self, WeightMatrixError<B>> {
         let ParsedWeightSpec {
             layout,
             quantization,
@@ -152,17 +179,22 @@ impl<B: Backend> WeightMatrix<B> {
             )));
         }
         let (rows, columns) = physical_shape(&layout, output_dim, input_dim);
+        let stored_matrix_count = matrix_count.map_or(1, NonZeroU32::get);
 
         if let Some(encoding) = microfloat {
-            let metadata = MicrofloatMetadata::new(encoding, rows, columns)
+            let metadata = MicrofloatMetadata::new(encoding, stored_matrix_count, rows, columns)
                 .map_err(|error| WeightMatrixError::UnsupportedConfiguration(error.to_string()))?;
             let group_size = encoding.group_size();
-            let values = tree.leaf("weights")?.validate(&[rows, columns / 2], DataType::U8)?.read_allocation()?;
-            let scales =
-                tree.leaf("scales")?.validate(&[rows, columns / group_size], DataType::U8)?.read_allocation()?;
-            // The artifact retains its established tensor name; at runtime this is
-            // the one outer scale applied after block-scale decoding.
-            let outer_scales = tree.leaf("global_scale")?.validate(&[1], data_type)?.read_allocation()?;
+            let values = tree
+                .leaf("weights")?
+                .validate(&matrix_shape(matrix_count, &[rows, columns / 2]), DataType::U8)?
+                .read_allocation()?;
+            let scales = tree
+                .leaf("scales")?
+                .validate(&matrix_shape(matrix_count, &[rows, columns / group_size]), DataType::U8)?
+                .read_allocation()?;
+            let outer_scales =
+                tree.leaf("global_scale")?.validate(&[stored_matrix_count], data_type)?.read_allocation()?;
             return Ok(Self {
                 values,
                 format: WeightFormat::Microfloat(Microfloat {
@@ -174,7 +206,10 @@ impl<B: Backend> WeightMatrix<B> {
         }
 
         let Some(info) = quantization else {
-            let values = tree.leaf("weights")?.validate(&[rows, columns], data_type)?.read_allocation()?;
+            let values = tree
+                .leaf("weights")?
+                .validate(&matrix_shape(matrix_count, &[rows, columns]), data_type)?
+                .read_allocation()?;
             return Ok(Self {
                 values,
                 format: WeightFormat::FullPrecision,
@@ -190,16 +225,26 @@ impl<B: Backend> WeightMatrix<B> {
             )));
         }
         let groups = columns.div_ceil(group_size);
-        let values =
-            tree.leaf("weights")?.validate(&[rows, columns / packing_divisor], storage_data_type)?.read_allocation()?;
-        let scales = tree.leaf("scales")?.validate(&[rows, groups], data_type)?.read_allocation()?;
+        let values = tree
+            .leaf("weights")?
+            .validate(&matrix_shape(matrix_count, &[rows, columns / packing_divisor]), storage_data_type)?
+            .read_allocation()?;
+        let scales = tree
+            .leaf("scales")?
+            .validate(&matrix_shape(matrix_count, &[rows, groups]), data_type)?
+            .read_allocation()?;
         let correction = match info.method {
             QuantizationMethod::ScaleBias => QuantizedCorrection::Biases(
-                tree.leaf("biases")?.validate(&[rows, groups], data_type)?.read_allocation()?,
+                tree.leaf("biases")?
+                    .validate(&matrix_shape(matrix_count, &[rows, groups]), data_type)?
+                    .read_allocation()?,
             ),
             QuantizationMethod::ScaleZeroPoint => QuantizedCorrection::ZeroPoints(
                 tree.leaf("zero_points")?
-                    .validate(&[rows, groups.div_ceil(packing_divisor)], storage_data_type)?
+                    .validate(
+                        &matrix_shape(matrix_count, &[rows, groups.div_ceil(packing_divisor)]),
+                        storage_data_type,
+                    )?
                     .read_allocation()?,
             ),
             QuantizationMethod::ScaleSymmetric => QuantizedCorrection::Symmetric,
@@ -330,6 +375,16 @@ fn physical_shape(
     }
 }
 
+fn matrix_shape(
+    matrix_count: Option<NonZeroU32>,
+    shape: &[u32],
+) -> Vec<u32> {
+    let Some(matrix_count) = matrix_count else {
+        return shape.into();
+    };
+    std::iter::once(matrix_count.get()).chain(shape.iter().copied()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -419,6 +474,7 @@ mod tests {
         };
         assert_eq!(metadata.rows(), 2);
         assert_eq!(metadata.columns(), 32);
+        assert_eq!(metadata.matrix_count(), 1);
         tree.assert_all_tensors_validated().expect("validate dense MXFP4 tensors");
     }
 }

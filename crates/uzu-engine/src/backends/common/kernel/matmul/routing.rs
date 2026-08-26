@@ -1,6 +1,8 @@
+use std::num::NonZeroU32;
+
 use super::{MatmulA, MatmulArguments, MatmulBKind};
 use crate::backends::common::{
-    Backend, BufferArg,
+    Allocation, Backend, BufferArg,
     gpu_types::gemm::{GemmBPrologueKind, GemmDTransform},
 };
 
@@ -16,6 +18,64 @@ pub struct A8ActivationPlan {
     pub sum_group_size: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertInput {
+    Tokens,
+    Routes,
+}
+
+pub struct ExpertRoutes<'a, B: Backend> {
+    pub expert_ids: &'a Allocation<B>,
+    pub routes_per_token: NonZeroU32,
+    pub expert_count: NonZeroU32,
+    pub input: ExpertInput,
+}
+
+impl<B: Backend> Copy for ExpertRoutes<'_, B> {}
+
+impl<B: Backend> Clone for ExpertRoutes<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub enum MatmulRouting<'a, B: Backend> {
+    Dense,
+    SparseReadout {
+        b_rows: &'a Allocation<B>,
+    },
+    Experts(ExpertRoutes<'a, B>),
+}
+
+impl<B: Backend> Copy for MatmulRouting<'_, B> {}
+
+impl<B: Backend> Clone for MatmulRouting<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, B: Backend> MatmulRouting<'a, B> {
+    pub fn sparse_readout_rows(self) -> Option<&'a Allocation<B>> {
+        match self {
+            Self::SparseReadout {
+                b_rows,
+            } => Some(b_rows),
+            Self::Dense | Self::Experts(_) => None,
+        }
+    }
+
+    pub fn expert_routes(self) -> Option<ExpertRoutes<'a, B>> {
+        match self {
+            Self::Experts(routes) => Some(routes),
+            Self::Dense
+            | Self::SparseReadout {
+                ..
+            } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct MatmulShape {
     pub m: u32,
@@ -29,7 +89,9 @@ pub struct MatmulShape {
     pub b_group_size: Option<u32>,
     pub signed_codes: bool,
     pub a_full_precision: bool,
-    pub gathered: bool,
+    pub sparse_readout: bool,
+    pub expert_routed: bool,
+    pub expert_bias: bool,
     pub d_transform: GemmDTransform,
 }
 
@@ -49,12 +111,14 @@ impl MatmulShape {
             b_group_size: arguments.b.group_size(),
             signed_codes: arguments.b.signed_codes(),
             a_full_precision: matches!(arguments.a, MatmulA::FullPrecision { .. }),
-            gathered: arguments.gather_indices.is_some(),
+            sparse_readout: arguments.routing.sparse_readout_rows().is_some(),
+            expert_routed: arguments.routing.expert_routes().is_some(),
+            expert_bias: arguments.d_transform.per_matrix_bias.is_some(),
             d_transform: arguments.d_transform.mask(),
         }
     }
 
-    pub fn is_quant(&self) -> bool {
-        self.b_prologue != GemmBPrologueKind::FullPrecision
+    pub fn is_integer_quantized(self) -> bool {
+        self.b_kind == MatmulBKind::Integer
     }
 }

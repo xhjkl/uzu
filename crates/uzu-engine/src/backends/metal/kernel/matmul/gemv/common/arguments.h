@@ -22,6 +22,8 @@ struct GemvOperands {
   const device BT* output_bias;
   const device int32_t* hadamard_factors;
   const device uint* gather_indices;
+  const device int* expert_ids;
+  const device BT* expert_biases;
 };
 
 struct GemvParams {
@@ -32,8 +34,35 @@ struct GemvParams {
   float soft_cap;
   GemmDTransform output_transform;
   bool gathered;
+  bool expert_routed;
+  bool expert_bias;
   bool signed_codes;
+  uint routes_per_token;
+  uint expert_count;
+  bool input_is_route_major;
 };
+
+template <typename AT, typename BT, typename DT>
+METAL_FUNC bool route_valid(
+    const thread GemvOperands<AT, BT, DT>& ops,
+    const thread GemvParams& params,
+    uint route
+) {
+  return !params.expert_routed || (ops.expert_ids[route] >= 0 && uint(ops.expert_ids[route]) < params.expert_count);
+}
+
+template <typename AT, typename BT, typename DT>
+METAL_FUNC uint matrix_index(
+    const thread GemvOperands<AT, BT, DT>& ops,
+    const thread GemvParams& params,
+    uint route
+) {
+  return route_valid(ops, params, route) && params.expert_routed ? uint(ops.expert_ids[route]) : 0;
+}
+
+METAL_FUNC uint input_row(const thread GemvParams& params, uint route) {
+  return params.expert_routed && !params.input_is_route_major ? route / params.routes_per_token : route;
+}
 
 } // namespace gemm
 } // namespace uzu

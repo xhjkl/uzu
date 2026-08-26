@@ -27,6 +27,17 @@ pub enum MatmulError<B: Backend> {
         path: &'static str,
         reason: &'static str,
     },
+    #[error("Invalid {operand} storage on path {path}: {reason}")]
+    InvalidStorage {
+        path: &'static str,
+        operand: &'static str,
+        reason: &'static str,
+    },
+    #[error("Unsupported matmul routing on path {path}: {reason}")]
+    UnsupportedRouting {
+        path: &'static str,
+        reason: &'static str,
+    },
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
 }

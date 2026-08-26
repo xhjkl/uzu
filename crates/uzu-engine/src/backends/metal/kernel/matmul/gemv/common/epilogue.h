@@ -85,11 +85,15 @@ private:
         if (tile.clamped && params.output_transform.contains(GemmDTransform::ACCUMULATE)) {
           return;
         }
+        if (!route_valid(ops, params, input_row)) {
+          output[R] = DT(0);
+          return;
+        }
         if constexpr (STAGE_HADAMARD) {
           shared_results[I * Tile::OUTPUT_ROWS + tile.local_row + R] =
-              transform<false>(result[I][R], output + R, global_row, ops, params);
+              transform<false>(result[I][R], output + R, global_row, input_row, ops, params);
         } else {
-          output[R] = static_cast<DT>(transform<true>(result[I][R], output + R, global_row, ops, params));
+          output[R] = static_cast<DT>(transform<true>(result[I][R], output + R, global_row, input_row, ops, params));
         }
       });
     });
@@ -100,6 +104,7 @@ private:
       U value,
       const device DT* output,
       uint global_row,
+      uint route,
       const thread GemvOperands<AT, BT, DT>& ops,
       const thread GemvParams& params
   ) {
@@ -113,6 +118,10 @@ private:
       if (params.output_transform.contains(GemmDTransform::BIAS)) {
         value += static_cast<U>(ops.output_bias[global_row]);
       }
+    }
+    if (params.expert_bias) {
+      const uint matrix = matrix_index(ops, params, route);
+      value += static_cast<U>(ops.expert_biases[matrix * params.out_vec_size + global_row]);
     }
     if (params.output_transform.contains(GemmDTransform::SOFT_CAP)) {
       value = apply_soft_cap(value, params.soft_cap);

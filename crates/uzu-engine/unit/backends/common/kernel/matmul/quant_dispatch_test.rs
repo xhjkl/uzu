@@ -275,6 +275,12 @@ fn parity_gemv_partial_group_bf16(
 
 #[rstest]
 #[test_attr(uzu_test)]
+#[case::n5_gs32_4bit_bias(1, 512, 5, 32, 4, QuantizationMethod::ScaleBias)]
+#[case::n6_gs32_4bit_zp_tail_k(1, 528, 6, 32, 4, QuantizationMethod::ScaleZeroPoint)]
+#[case::n7_gs32_4bit_sym(1, 512, 7, 32, 4, QuantizationMethod::ScaleSymmetric)]
+#[case::n5_gs32_8bit_bias(1, 256, 5, 32, 8, QuantizationMethod::ScaleBias)]
+#[case::n6_gs32_8bit_zp_tail_k(1, 272, 6, 32, 8, QuantizationMethod::ScaleZeroPoint)]
+#[case::n7_gs32_8bit_sym(1, 256, 7, 32, 8, QuantizationMethod::ScaleSymmetric)]
 #[case::n12_gs32_4bit(1, 256, 12, 32, 4, QuantizationMethod::ScaleBias)]
 #[case::n20_gs64_4bit_zp(2, 256, 20, 64, 4, QuantizationMethod::ScaleZeroPoint)]
 #[case::n36_gs32_8bit(1, 256, 36, 32, 8, QuantizationMethod::ScaleBias)]
@@ -727,7 +733,11 @@ fn run_widened_f32<B: Backend>(
     context: &B::Context,
     input: &QuantInput<bf16>,
 ) -> Vec<f32> {
-    use crate::{backends::common::kernel::matmul::MatmulA, data_type::DataType, tests::helpers::alloc_allocation};
+    use crate::{
+        backends::common::kernel::matmul::{MatmulA, MatmulRouting},
+        data_type::DataType,
+        tests::helpers::alloc_allocation,
+    };
     let buffers = QuantBuffers::<B, bf16>::allocate(context, input);
     let mut y = alloc_allocation::<B, f32>(context, (input.m as usize) * (input.n as usize));
     let mut matmul =
@@ -747,7 +757,7 @@ fn run_widened_f32<B: Backend>(
                 b_transpose: true,
                 d: &mut y,
                 d_transform: MatmulDOps::none(),
-                gather_indices: None,
+                routing: MatmulRouting::Dense,
                 m: input.m,
                 n: input.n,
                 k: input.k,
