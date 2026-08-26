@@ -28,9 +28,9 @@ template <
     uint GROUP_LANES,
     uint NUM_SIMDGROUPS,
     bool MICROFLOAT>
-VARIANTS(AT, bfloat, float)
-VARIANTS(BT, bfloat, float)
-VARIANTS(DT, bfloat, float)
+VARIANTS(AT, half, bfloat, float)
+VARIANTS(BT, half, bfloat, float)
+VARIANTS(DT, half, bfloat, float)
 CONSTRAINT(BT != "float" || (AT == "float" && DT == "float"))
 VARIANTS(
     B_PROLOGUE,
