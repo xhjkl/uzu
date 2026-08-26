@@ -206,14 +206,36 @@ impl MatmulKernel for MatmulMetalKernel {
         arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
         encoder: &mut Encoder<Metal>,
     ) -> Result<(), MetalError> {
+        let shape = MatmulShape::from_arguments(&arguments);
         if let MatmulB::Microfloat {
+            codes,
+            scales,
+            outer_scales,
             metadata,
-            ..
         } = &arguments.b
         {
-            return Err(MatmulError::UnsupportedMicrofloat(metadata.format()).into());
+            let rows_match = arguments.gather_indices.is_some() || metadata.rows() == arguments.n;
+            if !arguments.b_transpose
+                || arguments.b_leading_dimension.is_some()
+                || !rows_match
+                || metadata.columns() != arguments.k
+                || codes.size() < metadata.required_code_bytes()
+                || scales.size() < metadata.required_scale_bytes()
+                || outer_scales.size() < self.weights_data_type.size_in_bytes()
+            {
+                return Err(MatmulError::InvalidMicrofloatStorage.into());
+            }
+            let gemv = GemvSpecialization::select_microfloat(
+                &shape,
+                self.weights_data_type,
+                self.input_data_type,
+                self.output_data_type,
+            );
+            if let Some(gemv) = gemv {
+                return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from);
+            }
+            return self.gemm.encode_microfloat(arguments, encoder);
         }
-        let shape = MatmulShape::from_arguments(&arguments);
         let plan = match self.select_dispatch(&shape, encoder.context()) {
             MatmulDispatch::Gemv(gemv) => {
                 return self.gemv.encode(arguments, gemv, encoder).map_err(MetalError::from);

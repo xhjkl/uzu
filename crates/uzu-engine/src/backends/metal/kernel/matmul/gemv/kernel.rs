@@ -28,6 +28,7 @@ pub struct GemvSpecialization {
     input_row_tile: u32,
     reduction_lanes: u32,
     group_lanes: u32,
+    microfloat: bool,
     gathered: bool,
     signed_codes: bool,
     full_tile: bool,
@@ -92,11 +93,41 @@ impl GemvSpecialization {
         output_data_type: DataType,
         tile: policy::GemvTile,
     ) -> Option<Self> {
+        Self::select_tile_for_format(shape, weights_data_type, input_data_type, output_data_type, tile, false)
+    }
+
+    pub fn select_microfloat(
+        shape: &MatmulShape,
+        weights_data_type: DataType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+    ) -> Option<Self> {
+        if shape.m > GEMV_MAX_BATCH && !shape.gathered {
+            return None;
+        }
+        Self::select_tile_for_format(
+            shape,
+            weights_data_type,
+            input_data_type,
+            output_data_type,
+            policy::DEFAULT_TILE,
+            true,
+        )
+    }
+
+    fn select_tile_for_format(
+        shape: &MatmulShape,
+        weights_data_type: DataType,
+        input_data_type: DataType,
+        output_data_type: DataType,
+        tile: policy::GemvTile,
+        microfloat: bool,
+    ) -> Option<Self> {
         if !shape.b_transpose || !shape.a_full_precision {
             return None;
         }
         let is_quant = shape.is_quant();
-        let bad_leading_dimension = if is_quant {
+        let bad_leading_dimension = if is_quant || microfloat {
             shape.b_leading_dimension.is_some()
         } else {
             shape.b_leading_dimension.is_some_and(|ld| ld != shape.k)
@@ -111,14 +142,16 @@ impl GemvSpecialization {
             return None;
         }
         let bits = shape.b_bits.unwrap_or(0);
-        if !is_quant {
+        if !is_quant && !microfloat {
             let mixed_precision = weights_data_type == DataType::F32
                 && (input_data_type != DataType::F32 || output_data_type != DataType::F32);
             if mixed_precision || shape.n < DEFAULT_RESULTS_PER_SIMDGROUP || shape.m > GEMV_MAX_BATCH {
                 return None;
             }
         }
-        let block_size = if !is_quant {
+        let block_size = if microfloat {
+            shape.b_group_size.unwrap_or(FP_K_BLOCK)
+        } else if !is_quant {
             FP_K_BLOCK
         } else if bits == 4 {
             512
@@ -126,8 +159,7 @@ impl GemvSpecialization {
             256
         };
         let input_aligned = shape.k.is_multiple_of(block_size);
-        // Gathered quantized rows cannot share one input tile.
-        if is_quant && shape.gathered && tile.input_row_tile > 1 {
+        if (is_quant && shape.gathered || microfloat) && tile.input_row_tile > 1 {
             return None;
         }
         let specialization = Self {
@@ -142,6 +174,7 @@ impl GemvSpecialization {
             input_row_tile: tile.input_row_tile,
             reduction_lanes: tile.reduction_lanes,
             group_lanes: tile.group_lanes,
+            microfloat,
             gathered: shape.gathered,
             signed_codes: shape.signed_codes,
             full_tile: full_tile(shape, tile),
@@ -175,6 +208,7 @@ impl GemvSpecialization {
             self.reduction_lanes,
             self.group_lanes,
             self.num_simdgroups,
+            self.microfloat,
             self.output_transform,
             self.gathered,
             self.signed_codes,
@@ -271,27 +305,29 @@ impl GemvKernel {
         };
 
         // Preserve each weight buffer's residency range.
-        let (scales, zero_points, biases) = match &b {
+        let (scales, zero_points, biases, outer_scales) = match &b {
             MatmulB::FullPrecision {
                 ..
-            }
-            | MatmulB::Microfloat {
+            } => (None, None, None, None),
+            MatmulB::Microfloat {
+                scales,
+                outer_scales,
                 ..
-            } => (None, None, None),
+            } => (Some(*scales), None, None, Some(*outer_scales)),
             MatmulB::ScaleBiasDequant {
                 scales,
                 biases,
                 ..
-            } => (Some(*scales), None, Some(*biases)),
+            } => (Some(*scales), None, Some(*biases), None),
             MatmulB::ScaleZeroPointDequant {
                 scales,
                 zero_points,
                 ..
-            } => (Some(*scales), Some(*zero_points), None),
+            } => (Some(*scales), Some(*zero_points), None, None),
             MatmulB::ScaleSymmetricDequant {
                 scales,
                 ..
-            } => (Some(*scales), None, None),
+            } => (Some(*scales), None, None, None),
         };
 
         let output_group_count = n.div_ceil(specialization.output_row_tile());
@@ -299,11 +335,27 @@ impl GemvKernel {
         let pipeline = self.get_or_create(context, specialization)?;
         match b {
             MatmulB::Microfloat {
-                metadata,
+                codes: weights,
                 ..
-            } => {
-                return Err(MatmulError::UnsupportedMicrofloat(metadata.format()));
-            },
+            } => pipeline.encode(
+                weights,
+                scales,
+                zero_points,
+                biases,
+                outer_scales,
+                (a, a_offset),
+                &mut *d,
+                output_bias,
+                rht_factors,
+                gather_indices,
+                k,
+                n,
+                m,
+                ab_scale,
+                output_group_count,
+                soft_cap,
+                encoder,
+            ),
             MatmulB::FullPrecision {
                 b: weights,
             } => pipeline.encode(
@@ -311,6 +363,7 @@ impl GemvKernel {
                 scales,
                 zero_points,
                 biases,
+                outer_scales,
                 (a, a_offset),
                 &mut *d,
                 output_bias,
@@ -340,6 +393,7 @@ impl GemvKernel {
                 scales,
                 zero_points,
                 biases,
+                outer_scales,
                 (a, a_offset),
                 &mut *d,
                 output_bias,

@@ -2,6 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use super::{
     GemmEngine, GemmPlan,
+    microfloat::MicrofloatGemmDispatch,
     selection::{GemmProblem, outer_block_k},
     specialization::GemmSpecialization,
 };
@@ -37,6 +38,7 @@ pub struct GemmKernel {
     pub bias_add: TensorAddBiasMetalKernel,
     output_rht: ActivationTransform<Metal>,
     split_k_reduce: HashMap<GemmDTransform, GemmSplitKReduceMetalKernel>,
+    microfloat: MicrofloatGemmDispatch,
 }
 
 impl GemmKernel {
@@ -56,6 +58,7 @@ impl GemmKernel {
             bias_add,
             output_rht,
             split_k_reduce: HashMap::new(),
+            microfloat: MicrofloatGemmDispatch::new(weights_data_type, input_data_type, output_data_type),
         };
         Ok(kernel)
     }
@@ -432,6 +435,14 @@ impl GemmKernel {
         }
 
         Ok(())
+    }
+
+    pub(in crate::backends::metal::kernel::matmul) fn encode_microfloat<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
+        &mut self,
+        arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
+        encoder: &mut Encoder<Metal>,
+    ) -> Result<(), MetalError> {
+        self.microfloat.encode(arguments, encoder)
     }
 
     #[allow(clippy::too_many_arguments)]

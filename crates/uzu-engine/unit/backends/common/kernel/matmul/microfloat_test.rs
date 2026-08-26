@@ -12,7 +12,7 @@ use crate::{
     data_type::DataType,
     tests::{
         assert::assert_eq_float,
-        helpers::{alloc_allocation, alloc_allocation_with_data, allocation_to_vec},
+        helpers::{alloc_allocation, alloc_allocation_with_data, allocation_to_vec, for_each_non_cpu_backend},
     },
 };
 
@@ -27,6 +27,55 @@ fn packed_codes() -> Vec<u8> {
             low | (high << 4)
         })
         .collect()
+}
+
+fn execute_mxfp4<B: Backend>(
+    row_count: usize,
+    group_size: usize,
+    input_values: &[f32],
+    codes: &[u8],
+    scales: &[u8],
+) -> Vec<f32> {
+    let encoding =
+        MicrofloatEncoding::new(MicrofloatFormat::Mxfp4, 4, group_size as u32).expect("valid MXFP4 encoding");
+    let metadata = MicrofloatMetadata::new(encoding, N as u32, K as u32).expect("valid dense MXFP4 metadata");
+    let context = B::Context::new().expect("create backend context");
+    let input = alloc_allocation_with_data::<B, f32>(context.as_ref(), input_values);
+    let codes = alloc_allocation_with_data::<B, u8>(context.as_ref(), codes);
+    let scales = alloc_allocation_with_data::<B, u8>(context.as_ref(), scales);
+    let outer_scales = alloc_allocation_with_data::<B, f32>(context.as_ref(), &[1.25]);
+    let mut output = alloc_allocation::<B, f32>(context.as_ref(), row_count * N);
+    let mut kernel =
+        <B::Kernels as Kernels>::MatmulKernel::new(context.as_ref(), DataType::F32, DataType::F32, DataType::F32)
+            .expect("create matmul kernel");
+    let mut encoder = Encoder::<B>::new(context.as_ref()).expect("create encoder");
+    kernel
+        .encode(
+            MatmulArguments {
+                a: MatmulA::FullPrecision {
+                    values: &input,
+                    offset: 0,
+                },
+                b: MatmulB::<B>::Microfloat {
+                    codes: &codes,
+                    scales: &scales,
+                    outer_scales: &outer_scales,
+                    metadata,
+                },
+                b_leading_dimension: None,
+                b_transpose: true,
+                d: &mut output,
+                d_transform: MatmulDOps::none(),
+                gather_indices: None,
+                m: row_count as u32,
+                n: N as u32,
+                k: K as u32,
+            },
+            &mut encoder,
+        )
+        .expect("encode MXFP4 matmul");
+    encoder.end_encoding().submit().wait_until_completed().expect("execute MXFP4 matmul");
+    allocation_to_vec::<B, f32>(&output)
 }
 
 #[uzu_test]
@@ -102,6 +151,23 @@ fn cpu_executes_dense_mxfp4_matmul() {
                 }
             }
             assert_eq_float(&expected, &actual, 1e-5, "CPU dense MXFP4");
+        }
+    }
+}
+
+#[uzu_test]
+fn metal_matches_cpu_for_mxfp4_gemv_and_gemm() {
+    for row_count in [1, 12] {
+        for group_size in [16, 32] {
+            let input_values: Vec<f32> = (0..row_count * K).map(|index| (index % 13) as f32 * 0.125 - 0.5).collect();
+            let codes = packed_codes();
+            let scales: Vec<u8> = (0..N * K / group_size).map(|index| 126 + (index % 3) as u8).collect();
+            let expected = execute_mxfp4::<Cpu>(row_count, group_size, &input_values, &codes, &scales);
+
+            for_each_non_cpu_backend!(|B| {
+                let actual = execute_mxfp4::<B>(row_count, group_size, &input_values, &codes, &scales);
+                assert_eq_float(&expected, &actual, 1e-4, std::any::type_name::<B>());
+            });
         }
     }
 }
