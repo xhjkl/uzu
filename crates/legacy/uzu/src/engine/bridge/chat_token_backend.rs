@@ -7,7 +7,6 @@ use std::{
 };
 
 use futures::Stream;
-use parking_lot::{Mutex, MutexGuard};
 use shoji::{
     traits::{
         State,
@@ -30,7 +29,7 @@ use uzu_engine::{
     backends::common::Backend,
     engine::{
         Engine,
-        language_model::{LanguageModel, state::LanguageModelState, stream::LanguageModelStream},
+        language_model::{LanguageModel, stream::LanguageModelStream},
     },
 };
 
@@ -90,7 +89,7 @@ impl<B: Backend> UzuChatTokenBackendInstance<B> {
     }
 }
 
-impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
+impl<B: Backend + 'static> BackendInstance for UzuChatTokenBackendInstance<B> {
     type StreamConfig = ChatReplyConfig;
     type StreamInput = ChatTokenStreamInput;
     type StreamOutput = ChatTokenStreamOutput;
@@ -129,7 +128,7 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
 
         let state =
             (state as &mut dyn Any).downcast_mut::<UzuChatTokenBackendInstanceState<B>>().unwrap().value.clone();
-        let mut state_guard = Box::pin(state.lock());
+        let state_guard = state.lock_arc();
 
         let token_limit = config.token_limit.map(|count| count as usize);
 
@@ -161,7 +160,7 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
             options.grammar = grammar;
         }
 
-        let stream = match self.model.stream(input, &mut state_guard, options) {
+        let stream = match LanguageModelStream::new_owned(model, input, state_guard, options) {
             Ok(iter) => iter,
             Err(err) => {
                 return Box::pin(NoMetricsStream::new(error_stream(err.to_string())));
@@ -170,17 +169,9 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
 
         Box::pin(UzuChatTokenStream::<B> {
             cancel_token: cancel_token.child_token(),
-            stream: unsafe { std::mem::transmute::<LanguageModelStream<'_, B>, LanguageModelStream<'a, B>>(stream) },
+            stream,
             tokens_generated: 0,
             token_limit,
-            _state_guard: unsafe {
-                std::mem::transmute::<
-                    Pin<Box<MutexGuard<'_, LanguageModelState<B>>>>,
-                    Pin<Box<MutexGuard<'a, LanguageModelState<B>>>>,
-                >(state_guard)
-            },
-            _state: state,
-            _model: model,
         })
     }
 
@@ -189,7 +180,7 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
     }
 }
 
-impl<B: Backend> ChatTokenBackendInstance for UzuChatTokenBackendInstance<B> {
+impl<B: Backend + 'static> ChatTokenBackendInstance for UzuChatTokenBackendInstance<B> {
     fn tokenizer(&self) -> Arc<Tokenizer> {
         self.model.tokenizer().clone()
     }
@@ -207,19 +198,14 @@ impl<B: Backend> ChatTokenBackendInstance for UzuChatTokenBackendInstance<B> {
     }
 }
 
-// Horrible code
-
-struct UzuChatTokenStream<'a, B: Backend> {
+struct UzuChatTokenStream<B: Backend + 'static> {
     cancel_token: CancellationToken,
-    stream: LanguageModelStream<'a, B>,
+    stream: LanguageModelStream<'static, B>,
     tokens_generated: usize,
     token_limit: Option<usize>,
-    _state_guard: Pin<Box<MutexGuard<'a, LanguageModelState<B>>>>,
-    _state: Arc<Mutex<LanguageModelState<B>>>,
-    _model: Arc<LanguageModel<B>>,
 }
 
-impl<'a, B: Backend> UzuChatTokenStream<'a, B> {
+impl<B: Backend + 'static> UzuChatTokenStream<B> {
     fn next(&mut self) -> Result<Option<TokenStreamOutput>, BackendError> {
         if self.cancel_token.is_cancelled() {
             return Ok(None);
@@ -244,7 +230,7 @@ impl<'a, B: Backend> UzuChatTokenStream<'a, B> {
     }
 }
 
-impl<'a, B: Backend> Stream for UzuChatTokenStream<'a, B> {
+impl<B: Backend + 'static> Stream for UzuChatTokenStream<B> {
     type Item = Result<TokenStreamOutput, BackendError>;
 
     fn poll_next(
@@ -260,7 +246,7 @@ impl<'a, B: Backend> Stream for UzuChatTokenStream<'a, B> {
     }
 }
 
-impl<'a, B: Backend> InstanceStream for UzuChatTokenStream<'a, B> {
+impl<B: Backend + 'static> InstanceStream for UzuChatTokenStream<B> {
     type Metrics = ChatTokenStreamMetrics;
 
     fn metrics(&self) -> Self::Metrics {

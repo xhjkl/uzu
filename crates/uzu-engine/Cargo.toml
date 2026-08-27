@@ -71,7 +71,7 @@ bytemuck = { workspace = true, features = ["derive"] }
 num-traits.workspace = true
 libm.workspace = true
 itertools.workspace = true
-parking_lot.workspace = true
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos"))'.dependencies]
 objc2 = { workspace = true, optional = true }
