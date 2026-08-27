@@ -25,6 +25,8 @@ pub(super) struct GemmSpecialization {
     pub(super) a_group_size: Option<u32>,
     pub(super) stage_weight_scales: bool,
     pub(super) hoist_operand_addressing: bool,
+    pub(super) expert_routed: bool,
+    pub(super) expert_bias: bool,
 }
 
 impl GemmSpecialization {
@@ -57,6 +59,8 @@ impl GemmSpecialization {
                 true
             },
             hoist_operand_addressing: use_tuned_addressing && plan.should_hoist_operand_addressing(shape),
+            expert_routed: shape.expert_routed,
+            expert_bias: shape.expert_bias,
         };
         specialization.validate()?;
         Ok(specialization)
@@ -101,6 +105,11 @@ impl GemmSpecialization {
         }
         if self.bits_per_b.is_some() && !self.transpose_b {
             return Err(GemmSpecializationError::PackedRequiresTransposedB);
+        }
+        if self.expert_routed
+            && (self.use_mxu || !self.transpose_b || self.a_prologue != GemmAPrologueKind::FullPrecision)
+        {
+            return Err(GemmSpecializationError::UnsupportedExpertRouting);
         }
         Ok(())
     }

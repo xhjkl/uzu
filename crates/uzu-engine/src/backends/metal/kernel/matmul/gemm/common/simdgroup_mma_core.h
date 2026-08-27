@@ -24,6 +24,81 @@ namespace uzu {
 namespace gemm {
 
 template <
+    typename T,
+    ushort ROWS,
+    ushort COLS,
+    ushort SHARED_LEADING_DIMENSION,
+    ushort THREADGROUP_SIZE,
+    ushort READS_PER_THREAD = (ROWS * COLS) / THREADGROUP_SIZE,
+    ushort THREAD_COLS = COLS / READS_PER_THREAD,
+    ushort THREAD_ROWS = THREADGROUP_SIZE / THREAD_COLS>
+struct RoutedALoader {
+  static_assert((ROWS * COLS) % THREADGROUP_SIZE == 0, "routed A tile must divide evenly across threads");
+  static_assert(COLS % READS_PER_THREAD == 0, "routed A reads must divide the K tile");
+  static_assert(THREADGROUP_SIZE % THREAD_COLS == 0, "routed A rows must divide evenly across threads");
+
+  const device T* source;
+  const device uint* grouped_routes;
+  threadgroup T* destination;
+  uint grouped_base;
+  uint routes_per_token;
+  uint source_leading_dimension;
+  uint k_offset;
+  bool input_is_route_major;
+  ushort tile_row_index;
+  ushort tile_col_index;
+
+  METAL_FUNC RoutedALoader(
+      const device T* source_,
+      const device uint* grouped_routes_,
+      threadgroup T* destination_,
+      uint grouped_base_,
+      uint routes_per_token_,
+      uint source_leading_dimension_,
+      bool input_is_route_major_,
+      const thread ThreadContext& thread_context
+  )
+      : source(source_), grouped_routes(grouped_routes_), destination(destination_), grouped_base(grouped_base_),
+        routes_per_token(routes_per_token_), source_leading_dimension(source_leading_dimension_), k_offset(0),
+        input_is_route_major(input_is_route_major_) {
+    const ushort thread_index = thread_context.simdgroup_index * METAL_SIMD_SIZE + thread_context.simd_lane_id;
+    tile_row_index = thread_index / THREAD_COLS;
+    tile_col_index = READS_PER_THREAD * (thread_index % THREAD_COLS);
+  }
+
+  METAL_FUNC void load_unsafe() const {
+    METAL_PRAGMA_UNROLL
+    for (ushort row = tile_row_index; row < ROWS; row += THREAD_ROWS) {
+      const uint route = grouped_routes[grouped_base + row];
+      const uint input_row = input_is_route_major ? route : route / routes_per_token;
+      METAL_PRAGMA_UNROLL
+      for (ushort column = 0; column < READS_PER_THREAD; ++column) {
+        destination[row * SHARED_LEADING_DIMENSION + tile_col_index + column] =
+            source[size_t(input_row) * source_leading_dimension + k_offset + tile_col_index + column];
+      }
+    }
+  }
+
+  METAL_FUNC void load_safe(short2 source_tile_dimensions) const {
+    METAL_PRAGMA_UNROLL
+    for (ushort row = tile_row_index; row < ROWS; row += THREAD_ROWS) {
+      const bool valid_row = row < source_tile_dimensions.y;
+      const uint route = valid_row ? grouped_routes[grouped_base + row] : 0;
+      const uint input_row = input_is_route_major ? route : route / routes_per_token;
+      METAL_PRAGMA_UNROLL
+      for (ushort column = 0; column < READS_PER_THREAD; ++column) {
+        const ushort local_column = tile_col_index + column;
+        const bool valid = valid_row && local_column < source_tile_dimensions.x;
+        destination[row * SHARED_LEADING_DIMENSION + local_column] =
+            valid ? source[size_t(input_row) * source_leading_dimension + k_offset + local_column] : T(0);
+      }
+    }
+  }
+
+  METAL_FUNC void next() { k_offset += COLS; }
+};
+
+template <
     typename OutputElementType_,
     GemmTiling GEMM_TILING,
     bool TRANSPOSE_B,
@@ -80,12 +155,12 @@ struct SimdgroupMmaCore {
       float,
       uzu::matmul::TransformNone<OutputElementType, float>>;
 
-  template <uint GEMM_ALIGNMENT_RAW, typename BLoader>
+  template <uint GEMM_ALIGNMENT_RAW, typename ALoaderType, typename BLoader>
   static METAL_FUNC void k_loop(
       threadgroup LeftElementType* a_shared,
       threadgroup RightElementType* b_shared,
       const int aligned_k_iterations,
-      thread ALoader& loader_a,
+      thread ALoaderType& loader_a,
       thread BLoader& loader_b,
       thread TileAccumulator& accumulator,
       thread const ushort& tile_block_rows,
@@ -192,6 +267,46 @@ struct SimdgroupMmaCore {
     }
   }
 
+  static METAL_FUNC void finalize_routed(
+      thread TileAccumulator& accumulator,
+      device OutputElementType* d,
+      const constant uzu::matmul::GemmParams* params,
+      const device uint* grouped_routes,
+      size_t grouped_base,
+      ushort tile_block_rows,
+      size_t block_col,
+      ushort tile_block_cols,
+      uint expert,
+      GemmDTransform output_transform,
+      const device RightElementType* output_bias,
+      const device RightElementType* expert_biases
+  ) {
+    accumulator.for_each_output([&](ushort row_offset, ushort col_offset, ushort lane_offset, thread float& value) {
+      const ushort row = accumulator.simdgroup_row_offset + row_offset;
+      const ushort column = accumulator.simdgroup_col_offset + col_offset + lane_offset;
+      if (row >= tile_block_rows || column >= tile_block_cols) {
+        return;
+      }
+
+      if (output_transform.contains(GemmDTransform::SCALE)) {
+        value *= params->ab_scale;
+      }
+      const size_t global_column = block_col + column;
+      if (output_transform.contains(GemmDTransform::BIAS)) {
+        value += float(output_bias[global_column]);
+      }
+      if (expert_biases != nullptr) {
+        value += float(expert_biases[size_t(expert) * params->N + global_column]);
+      }
+      if (output_transform.contains(GemmDTransform::SOFT_CAP)) {
+        value = uzu::apply_soft_cap(value, params->soft_cap);
+      }
+
+      const uint route = grouped_routes[grouped_base + row];
+      d[size_t(route) * params->leading_dimension_d + global_column] = OutputElementType(value);
+    });
+  }
+
   static METAL_FUNC void run(
       LeftStorage left,
       RightStorage right,
@@ -277,7 +392,7 @@ struct SimdgroupMmaCore {
         );
         if constexpr (Right::MICROFLOAT) {
           // Keep the outer scale in f32; E2M1 x E8M0 is exact in BF16 staging.
-          const float outer_scale = right.mxfp4_outer_scale();
+          const float outer_scale = right.mxfp4_outer_scale(0);
           accumulator.c_fragment.map([&](float value) { return value * outer_scale; });
         }
         finalize<gemm_alignment>(
@@ -334,6 +449,142 @@ struct SimdgroupMmaCore {
           thread_context
       );
       run_with_loader(loader_b);
+    }
+  }
+
+  static METAL_FUNC void run_routed(
+      LeftStorage left,
+      RightStorage right,
+      device OutputElementType* d,
+      const constant uzu::matmul::GemmParams* params,
+      GemmAlignment alignment,
+      GemmDTransform output_transform,
+      const device RightElementType* output_bias,
+      const device RightElementType* expert_biases,
+      const device uint* route_offsets,
+      const device uint* grouped_routes,
+      uint routes_per_token,
+      bool input_is_route_major,
+      uint row_partitions,
+      threadgroup LeftElementType* a_shared,
+      threadgroup RightElementType* b_shared,
+      const thread ThreadContext& thread_context
+  ) {
+    const uint expert = thread_context.threadgroup_position.y;
+    const uint partition = thread_context.threadgroup_position.z;
+    const uint begin = route_offsets[expert];
+    const uint end = route_offsets[expert + 1];
+    const size_t block_col = size_t(thread_context.threadgroup_position.x) * THREADGROUP_BLOCK_N;
+    if (block_col >= params->N) {
+      return;
+    }
+
+    const ushort tile_block_cols = min(THREADGROUP_BLOCK_N, int(params->N - block_col));
+    const ushort leftover_block_depth = params->K - params->aligned_inner_iterations * THREADGROUP_BLOCK_K;
+    const size_t bank_block_col = size_t(expert) * params->N + block_col;
+    const uint grouped_stride = row_partitions * THREADGROUP_BLOCK_M;
+
+    for (size_t grouped_base = size_t(begin) + partition * THREADGROUP_BLOCK_M; grouped_base < end;
+         grouped_base += grouped_stride) {
+      const ushort tile_block_rows = min(THREADGROUP_BLOCK_M, int(size_t(end) - grouped_base));
+      thread RoutedALoader<
+          LeftElementType,
+          THREADGROUP_BLOCK_M,
+          THREADGROUP_BLOCK_K,
+          SHARED_STRIDE_A,
+          THREADGROUP_THREADS>
+          loader_a(
+              left.values,
+              grouped_routes,
+              a_shared,
+              uint(grouped_base),
+              routes_per_token,
+              params->leading_dimension_a,
+              input_is_route_major,
+              thread_context
+          );
+      thread TileAccumulator accumulator(thread_context);
+
+      const bool all_aligned =
+          (alignment.contains(GemmAlignment::N) || tile_block_cols == THREADGROUP_BLOCK_N) &&
+          alignment.contains(GemmAlignment::K);
+      constexpr uint MASK_NK = static_cast<uint>(GemmAlignment::N) | static_cast<uint>(GemmAlignment::K);
+      const uint dynamic_alignment_mask =
+          (tile_block_cols == THREADGROUP_BLOCK_N ? static_cast<uint>(GemmAlignment::N) : 0u) |
+          (alignment.contains(GemmAlignment::K) ? static_cast<uint>(GemmAlignment::K) : 0u);
+
+      auto run_with_loader = [&](auto loader_b) {
+        auto kernel_invoke = [&](auto gemm_alignment_mask) {
+          constexpr uint gemm_alignment = gemm_alignment_mask.value;
+          k_loop<gemm_alignment>(
+              a_shared,
+              b_shared,
+              params->aligned_inner_iterations,
+              loader_a,
+              loader_b,
+              accumulator,
+              tile_block_rows,
+              tile_block_cols,
+              leftover_block_depth
+          );
+          if constexpr (Right::MICROFLOAT) {
+            const float outer_scale = right.mxfp4_outer_scale(expert);
+            accumulator.c_fragment.map([&](float value) { return value * outer_scale; });
+          }
+          finalize_routed(
+              accumulator,
+              d,
+              params,
+              grouped_routes,
+              grouped_base,
+              tile_block_rows,
+              block_col,
+              tile_block_cols,
+              expert,
+              output_transform,
+              output_bias,
+              expert_biases
+          );
+        };
+
+        if (all_aligned) {
+          kernel_invoke(integral_constant<uint, MASK_NK>{});
+        } else {
+          dispatch_gemm_alignment(dynamic_alignment_mask, kernel_invoke);
+        }
+      };
+
+      if constexpr (Right::DENSE) {
+        auto loader_b = schedules::make_full_precision_loader<SimdgroupMmaCore>(
+            right,
+            params,
+            bank_block_col,
+            0,
+            b_shared,
+            thread_context
+        );
+        run_with_loader(loader_b);
+      } else if constexpr (Right::MICROFLOAT) {
+        auto loader_b = schedules::make_mxfp4_loader<SimdgroupMmaCore, RightOperand>(
+            right,
+            params,
+            bank_block_col,
+            0,
+            b_shared,
+            thread_context
+        );
+        run_with_loader(loader_b);
+      } else {
+        auto loader_b = schedules::make_staged_loader<SimdgroupMmaCore, RightOperand>(
+            right,
+            params,
+            bank_block_col,
+            0,
+            b_shared,
+            thread_context
+        );
+        run_with_loader(loader_b);
+      }
     }
   }
 };

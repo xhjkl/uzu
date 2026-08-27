@@ -141,15 +141,22 @@ KERNEL(Gemm)(
     const device int8_t* a_int8 OPTIONAL(A_IS_INT8),
     const device float* a_scales OPTIONAL(A_IS_INT8),
     const device int32_t* a_group_sums OPTIONAL(NEEDS_ASYMMETRIC_WEIGHT_CORRECTION),
+    const device uint* route_offsets OPTIONAL(expert_routed),
+    const device uint* grouped_routes OPTIONAL(expert_routed),
+    const device BT* expert_biases OPTIONAL(expert_bias),
     const constant uzu::matmul::GemmParams* params,
     const constant uint& group_count_x,
     const constant uint& group_count_y,
     const constant uint& group_count_z,
+    const constant uint& routes_per_token,
+    const constant bool& input_is_route_major,
     const GemmDTransform output_transform SPECIALIZE,
     const GemmAlignment alignment SPECIALIZE,
     const bool signed_codes SPECIALIZE,
     const bool stage_weight_scales SPECIALIZE,
     const bool hoist_operand_addressing SPECIALIZE,
+    const bool expert_routed SPECIALIZE,
+    const bool expert_bias SPECIALIZE,
     threadgroup AT a_shared[GEMM_TGA_ELEMENTS],
     threadgroup BT b_shared[GEMM_TGB_ELEMENTS],
     const uint group_x GROUPS(group_count_x),
@@ -207,18 +214,39 @@ KERNEL(Gemm)(
     );
   } else {
     using Core = SimdgroupMmaCore<DT, GEMM_TILING, TRANSPOSE_B, LeftOperand, RightOperand>;
-    Core::run(
-        left_storage,
-        right_storage,
-        d,
-        params,
-        alignment,
-        output_transform,
-        output_bias,
-        rht_factors,
-        a_shared,
-        b_shared,
-        thread_context
-    );
+    if (expert_routed) {
+      Core::run_routed(
+          left_storage,
+          right_storage,
+          d,
+          params,
+          alignment,
+          output_transform,
+          output_bias,
+          expert_biases,
+          route_offsets,
+          grouped_routes,
+          routes_per_token,
+          input_is_route_major,
+          group_count_z,
+          a_shared,
+          b_shared,
+          thread_context
+      );
+    } else {
+      Core::run(
+          left_storage,
+          right_storage,
+          d,
+          params,
+          alignment,
+          output_transform,
+          output_bias,
+          rht_factors,
+          a_shared,
+          b_shared,
+          thread_context
+      );
+    }
   }
 }

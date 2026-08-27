@@ -34,6 +34,8 @@ pub(super) enum GemmPlanError {
     UnsupportedMicrofloatEngine,
     #[error("MXFP4 GEMM requires full-precision activations")]
     UnsupportedMicrofloatActivation,
+    #[error("expert routing requires transposed contiguous B, full-precision A, and the simdgroup engine")]
+    UnsupportedExpertRouting,
 }
 
 impl GemmProblem {
@@ -78,6 +80,14 @@ impl GemmProblem {
         if engine == GemmEngine::Mxu && !self.supports_mxu {
             return Err(GemmPlanError::MxuUnavailable);
         }
+        if self.shape.expert_routed
+            && (engine != GemmEngine::Simdgroup
+                || !self.shape.a_full_precision
+                || !self.shape.b_transpose
+                || self.shape.b_leading_dimension.is_some())
+        {
+            return Err(GemmPlanError::UnsupportedExpertRouting);
+        }
         if self.shape.b_kind == MatmulBKind::Mxfp4 && !self.shape.a_full_precision {
             return Err(GemmPlanError::UnsupportedMicrofloatActivation);
         }
@@ -109,7 +119,7 @@ impl GemmProblem {
             return false;
         }
         let alignment = GemmAlignment::new(
-            self.shape.m.is_multiple_of(plan.tiling.block_m()),
+            !self.shape.expert_routed && self.shape.m.is_multiple_of(plan.tiling.block_m()),
             self.shape.n.is_multiple_of(plan.tiling.block_n()),
             self.shape.k.is_multiple_of(plan.tiling.block_k()),
         );
@@ -143,7 +153,7 @@ impl GemmProblem {
         tiling: GemmTiling,
     ) -> u32 {
         let shape = self.shape;
-        if shape.b_kind == MatmulBKind::Mxfp4 {
+        if shape.expert_routed || shape.b_kind == MatmulBKind::Mxfp4 {
             return 1;
         }
         let splittable = shape.is_integer_quantized() || (shape.b_transpose && shape.b_leading_dimension.is_none());
@@ -206,7 +216,7 @@ pub(super) fn outer_block_k(
 }
 
 fn mxu_is_eligible(shape: MatmulShape) -> bool {
-    if shape.b_kind == MatmulBKind::Mxfp4 {
+    if shape.expert_routed || shape.b_kind == MatmulBKind::Mxfp4 {
         return false;
     }
     if !shape.a_full_precision || shape.b_prologue == GemmBPrologueKind::FullPrecision {

@@ -81,6 +81,9 @@ impl GemvSpecialization {
         output_data_type: DataType,
         device_profile: DeviceProfile,
     ) -> Option<Self> {
+        if shape.expert_routed && shape.m > GEMV_MAX_BATCH {
+            return None;
+        }
         let integer_quantized = shape.is_integer_quantized();
         let bits = shape.b_bits.unwrap_or(0);
         let bf16_io = input_data_type == DataType::BF16 && output_data_type == DataType::BF16;
@@ -110,7 +113,11 @@ impl GemvSpecialization {
                 Some(policy::fp_tile(shape.m, shape.n, shape.k, input_aligned, device_profile))
             }
         };
-        Self::select_tile(shape, weights_data_type, input_data_type, output_data_type, tile?)
+        let mut tile = tile?;
+        if shape.expert_routed {
+            tile.input_row_tile = 1;
+        }
+        Self::select_tile(shape, weights_data_type, input_data_type, output_data_type, tile)
     }
 
     pub fn select_tile(

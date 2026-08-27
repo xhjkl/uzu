@@ -241,14 +241,12 @@ impl MatmulKernel for MatmulMetalKernel {
                 .into(),
             ));
         }
-        if arguments.routing.expert_routes().is_some() {
-            return Err(MetalError::KernelDispatchFailed(
-                format!(
-                    "expert routing requires the GEMV path, but shape (m={}, n={}) routes to GEMM",
-                    arguments.m, arguments.n
-                )
-                .into(),
-            ));
+        if arguments.d_transform.gate_act.is_some() {
+            return Err(MatmulError::<Metal>::UnsupportedDOp {
+                bit: crate::backends::common::gpu_types::gemm::GemmDTransform::GATE_ACT_MUL,
+                path: "MetalMatmul",
+            }
+            .into());
         }
         self.gemm.encode_plan(arguments, plan, encoder)
     }

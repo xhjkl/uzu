@@ -2,6 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use super::{
     GemmEngine, GemmPlan,
+    route_plan::ExpertRoutePlanner,
     selection::{GemmProblem, outer_block_k},
     specialization::GemmSpecialization,
 };
@@ -15,7 +16,7 @@ use crate::{
             },
             kernel::{
                 ActivationTransform, TensorAddBiasKernel,
-                matmul::{MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
+                matmul::{ExpertInput, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
             },
         },
         metal::{
@@ -37,6 +38,7 @@ pub struct GemmKernel {
     pub bias_add: TensorAddBiasMetalKernel,
     output_rht: ActivationTransform<Metal>,
     split_k_reduce: HashMap<GemmDTransform, GemmSplitKReduceMetalKernel>,
+    route_planner: ExpertRoutePlanner,
 }
 
 impl GemmKernel {
@@ -56,6 +58,7 @@ impl GemmKernel {
             bias_add,
             output_rht,
             split_k_reduce: HashMap::new(),
+            route_planner: ExpertRoutePlanner::new(context, output_data_type)?,
         };
         Ok(kernel)
     }
@@ -86,6 +89,8 @@ impl GemmKernel {
                     specialization.signed_codes,
                     specialization.stage_weight_scales,
                     specialization.hoist_operand_addressing,
+                    specialization.expert_routed,
+                    specialization.expert_bias,
                 )?;
                 Ok(entry.insert(kernel))
             },
@@ -150,6 +155,36 @@ impl GemmKernel {
             .validate_engine(plan.engine)
             .map_err(|error| MetalError::KernelDispatchFailed(Box::new(error)))?;
 
+        let routes = arguments.routing.expert_routes();
+        if routes.is_some()
+            && arguments
+                .d_transform
+                .mask()
+                .intersects(GemmDTransform::ACCUMULATE | GemmDTransform::RHT | GemmDTransform::GATE_ACT_MUL)
+        {
+            return Err(MatmulError::UnsupportedRouting {
+                path: "Gemm",
+                reason: "expert routing does not support accumulation, RHT, or gated activation",
+            }
+            .into());
+        }
+        let route_plan = match routes {
+            Some(routes) => {
+                Some(self.route_planner.encode(routes, arguments.m, arguments.n, &mut *arguments.d, encoder)?)
+            },
+            None => None,
+        };
+        let route_offsets = route_plan.as_ref().map(|plan| &plan.offsets);
+        let grouped_routes = route_plan.as_ref().map(|plan| &plan.grouped_routes);
+        let (routes_per_token, input_is_route_major, row_partitions) = match routes {
+            Some(routes) => (
+                routes.routes_per_token.get(),
+                routes.input == ExpertInput::Routes,
+                arguments.m.div_ceil(plan.tiling.block_m()).clamp(1, 16),
+            ),
+            None => (1, true, 1),
+        };
+
         let is_quant = shape.is_integer_quantized();
         if is_quant {
             let d_mask = arguments.d_transform.mask();
@@ -165,6 +200,7 @@ impl GemmKernel {
         let ab_scale = arguments.d_transform.ab_scale;
         let soft_cap = arguments.d_transform.soft_cap.unwrap_or(0.0);
         let output_bias = arguments.d_transform.bias;
+        let expert_biases = arguments.d_transform.per_matrix_bias;
         let rht_factors = arguments.d_transform.rht_factors;
         let output_transform = arguments.d_transform.mask();
 
@@ -214,13 +250,15 @@ impl GemmKernel {
                 };
                 let tiling = plan.tiling;
                 let alignment = GemmAlignment::new(
-                    m.is_multiple_of(tiling.block_m()),
+                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
                     n.is_multiple_of(tiling.block_n()),
                     k.is_multiple_of(tiling.block_k()),
                 );
                 let params = packed_params(shape, plan, ab_scale, soft_cap);
                 let group_count_x = n.div_ceil(tiling.block_n());
-                let group_count_y = m.div_ceil(tiling.block_m());
+                let group_count_y =
+                    routes.map_or_else(|| m.div_ceil(tiling.block_m()), |routes| routes.expert_count.get());
+                let group_count_z = routes.map_or(1, |_| row_partitions);
                 let specialization = GemmSpecialization::from_plan(
                     plan,
                     shape,
@@ -245,10 +283,15 @@ impl GemmKernel {
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
+                    route_offsets,
+                    grouped_routes,
+                    expert_biases,
                     std::slice::from_ref(&params),
                     group_count_x,
                     group_count_y,
-                    1,
+                    group_count_z,
+                    routes_per_token,
+                    input_is_route_major,
                     encoder,
                 );
             },
@@ -272,7 +315,9 @@ impl GemmKernel {
                 let threadgroups_per_row = n.div_ceil(tiling.block_n());
                 let threadgroups_per_column = m.div_ceil(tiling.block_m());
 
-                let (use_morton, group_count_x, group_count_y) = if use_mxu {
+                let (use_morton, group_count_x, group_count_y, group_count_z) = if let Some(routes) = routes {
+                    (false, threadgroups_per_row, routes.expert_count.get(), row_partitions)
+                } else if use_mxu {
                     let max_dim = threadgroups_per_row.max(threadgroups_per_column);
                     let min_dim = threadgroups_per_row.min(threadgroups_per_column);
                     let morton_dim = max_dim.next_power_of_two();
@@ -280,16 +325,19 @@ impl GemmKernel {
                     let actual_total = threadgroups_per_row.saturating_mul(threadgroups_per_column);
                     let use_morton = min_dim > 1 && morton_total <= 4_u32.saturating_mul(actual_total);
                     if use_morton {
-                        (true, morton_total, 1)
+                        (true, morton_total, 1, 1)
                     } else {
-                        (false, threadgroups_per_row, threadgroups_per_column)
+                        (false, threadgroups_per_row, threadgroups_per_column, 1)
                     }
                 } else {
-                    (false, threadgroups_per_row, threadgroups_per_column)
+                    (false, threadgroups_per_row, threadgroups_per_column, 1)
                 };
 
-                let alignment =
-                    GemmAlignment::new(m % tiling.block_m() == 0, n % tiling.block_n() == 0, k % tiling.block_k() == 0);
+                let alignment = GemmAlignment::new(
+                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
+                    n.is_multiple_of(tiling.block_n()),
+                    k.is_multiple_of(tiling.block_k()),
+                );
 
                 if plan.split_k > 1 {
                     return self.encode_split_k(
@@ -356,10 +404,15 @@ impl GemmKernel {
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
+                    route_offsets,
+                    grouped_routes,
+                    expert_biases,
                     std::slice::from_ref(&params),
                     group_count_x,
                     group_count_y,
-                    1,
+                    group_count_z,
+                    routes_per_token,
+                    input_is_route_major,
                     encoder,
                 );
             },
@@ -433,11 +486,16 @@ impl GemmKernel {
                 };
 
                 let tiling = plan.tiling;
-                let alignment =
-                    GemmAlignment::new(m % tiling.block_m() == 0, n % tiling.block_n() == 0, k % tiling.block_k() == 0);
+                let alignment = GemmAlignment::new(
+                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
+                    n.is_multiple_of(tiling.block_n()),
+                    k.is_multiple_of(tiling.block_k()),
+                );
                 let params = packed_params(shape, plan, ab_scale, soft_cap);
                 let group_count_x = n.div_ceil(tiling.block_n());
-                let group_count_y = m.div_ceil(tiling.block_m());
+                let group_count_y =
+                    routes.map_or_else(|| m.div_ceil(tiling.block_m()), |routes| routes.expert_count.get());
+                let group_count_z = routes.map_or(1, |_| row_partitions);
 
                 if plan.split_k > 1 {
                     self.encode_split_k(
@@ -480,10 +538,15 @@ impl GemmKernel {
                         a_int8,
                         a_scales,
                         a_group_sums,
+                        route_offsets,
+                        grouped_routes,
+                        expert_biases,
                         std::slice::from_ref(&params),
                         group_count_x,
                         group_count_y,
-                        1,
+                        group_count_z,
+                        routes_per_token,
+                        input_is_route_major,
                         encoder,
                     );
                 }
@@ -584,10 +647,17 @@ impl GemmKernel {
             a_int8,
             a_scales,
             a_group_sums,
+            None::<&Allocation<Metal>>,
+            None::<&Allocation<Metal>>,
+            None::<&Allocation<Metal>>,
             std::slice::from_ref(&params),
             base_gx,
             base_gy,
             split_k,
+            1,
+            1,
+            true,
+            1,
             encoder,
         );
 

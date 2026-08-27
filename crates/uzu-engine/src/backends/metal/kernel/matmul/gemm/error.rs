@@ -15,6 +15,8 @@ pub enum GemmSpecializationError {
     },
     #[error("packed B requires transposed layout")]
     PackedRequiresTransposedB,
+    #[error("expert routing requires transposed B, full-precision A, and the simdgroup engine")]
+    UnsupportedExpertRouting,
     #[error("tiling {tiling} does not match use_mxu={use_mxu}")]
     TilingUseMxuMismatch {
         tiling: GemmTiling,

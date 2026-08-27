@@ -124,9 +124,9 @@ struct RightStorage {
     return microfloat_scales;
   }
 
-  METAL_FUNC float mxfp4_outer_scale() const thread {
+  METAL_FUNC float mxfp4_outer_scale(uint matrix) const thread {
     static_assert(Right::MICROFLOAT, "mxfp4_outer_scale is only valid for MXFP4 weights");
-    return float(microfloat_outer_scale[0]);
+    return float(microfloat_outer_scale[matrix]);
   }
 };
 
