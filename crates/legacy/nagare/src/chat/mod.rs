@@ -725,7 +725,8 @@ fn aggregate_stats(
         duration: stats.iter().map(|stats| stats.duration).sum(),
         time_to_first_token: stats.iter().find_map(|stats| stats.time_to_first_token),
         prefill_tokens_per_second: stats.iter().find_map(|stats| stats.prefill_tokens_per_second),
-        generate_tokens_per_second: aggregate_generate_rate(&stats),
+        generate_tokens_per_second: aggregate_rate(&stats, |stats| stats.generate_tokens_per_second),
+        backend_generate_tokens_per_second: aggregate_rate(&stats, |stats| stats.backend_generate_tokens_per_second),
         tokens_count_input: sum_optional_u32(&stats, |stats| stats.tokens_count_input),
         tokens_count_input_cached: sum_optional_u32(&stats, |stats| stats.tokens_count_input_cached),
         tokens_count_output: sum_optional_u32(&stats, |stats| stats.tokens_count_output),
@@ -752,24 +753,27 @@ fn aggregate_speculator_stats(stats: &[&ChatReplyStats]) -> Option<ChatReplySpec
     })
 }
 
-fn aggregate_generate_rate(stats: &[&ChatReplyStats]) -> Option<f64> {
+fn aggregate_rate(
+    stats: &[&ChatReplyStats],
+    rate: impl Fn(&ChatReplyStats) -> Option<f64>,
+) -> Option<f64> {
     if let [stats] = stats {
-        return stats.generate_tokens_per_second;
+        return rate(stats);
     }
 
-    let (token_intervals, duration) = stats.iter().try_fold((0_u64, 0.0), |(token_intervals, duration), stats| {
+    let (intervals, duration) = stats.iter().try_fold((0_u64, 0.0), |(intervals, duration), stats| {
         let tokens = stats.tokens_count_output?;
         if tokens < 2 {
-            return Some((token_intervals, duration));
+            return Some((intervals, duration));
         }
-        let generate_rate = stats.generate_tokens_per_second?;
-        if !generate_rate.is_finite() || generate_rate <= 0.0 {
+        let rate = rate(stats)?;
+        if !rate.is_finite() || rate <= 0.0 {
             return None;
         }
-        let intervals = u64::from(tokens - 1);
-        Some((token_intervals + intervals, duration + intervals as f64 / generate_rate))
+        let reply_intervals = u64::from(tokens - 1);
+        Some((intervals + reply_intervals, duration + reply_intervals as f64 / rate))
     })?;
-    (token_intervals > 0 && duration > 0.0).then(|| token_intervals as f64 / duration)
+    (intervals > 0 && duration > 0.0).then(|| intervals as f64 / duration)
 }
 
 fn sum_optional_u32(

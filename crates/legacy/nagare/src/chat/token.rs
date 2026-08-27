@@ -410,12 +410,17 @@ impl StreamingState<'_> {
             None
         };
         let generate_tps = calculate_rate(self.total_tokens_output, generate_duration);
+        let backend_generate_tps = self.metrics.as_ref().and_then(|metrics| {
+            let decode_duration = metrics.decode_duration?;
+            calculate_rate(metrics.num_tokens_returned, Some(decode_duration))
+        });
 
         ChatReplyStats {
             duration: total_duration.as_secs_f64(),
             time_to_first_token: ttft_duration.map(|time| time.as_secs_f64()),
             prefill_tokens_per_second: prefill_tps,
             generate_tokens_per_second: generate_tps,
+            backend_generate_tokens_per_second: backend_generate_tps,
             tokens_count_input: Some(self.total_tokens_input as u32),
             tokens_count_input_cached: Some(self.cached_tokens_input as u32),
             tokens_count_output: Some(self.total_tokens_output as u32),

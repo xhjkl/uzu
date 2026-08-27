@@ -23,6 +23,8 @@ pub struct TokenStreamMetrics {
     pub num_tokens_proposed: usize,
     pub num_tokens_accepted: usize,
     pub num_tokens_returned: usize,
+    /// Cumulative backend call time after the first returned token.
+    pub decode_duration: Option<std::time::Duration>,
 }
 
 pub type StreamInput = Vec<u64>;

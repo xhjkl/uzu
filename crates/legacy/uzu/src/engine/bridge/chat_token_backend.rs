@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use futures::Stream;
@@ -172,6 +173,7 @@ impl<B: Backend + 'static> BackendInstance for UzuChatTokenBackendInstance<B> {
             stream,
             tokens_generated: 0,
             token_limit,
+            decode_duration: Duration::ZERO,
         })
     }
 
@@ -203,6 +205,7 @@ struct UzuChatTokenStream<B: Backend + 'static> {
     stream: LanguageModelStream<'static, B>,
     tokens_generated: usize,
     token_limit: Option<usize>,
+    decode_duration: Duration,
 }
 
 impl<B: Backend + 'static> UzuChatTokenStream<B> {
@@ -216,6 +219,7 @@ impl<B: Backend + 'static> UzuChatTokenStream<B> {
             return Ok(Some(TokenStreamOutput::LimitReached));
         }
 
+        let started = Instant::now();
         let token = self
             .stream
             .next()
@@ -223,6 +227,9 @@ impl<B: Backend + 'static> UzuChatTokenStream<B> {
             .map_err(|err| Box::<dyn std::error::Error + Send + Sync>::from(err.to_string()))?;
 
         if token.is_some() {
+            if self.tokens_generated > 0 {
+                self.decode_duration += started.elapsed();
+            }
             self.tokens_generated += 1;
         }
 
@@ -250,6 +257,8 @@ impl<B: Backend + 'static> InstanceStream for UzuChatTokenStream<B> {
     type Metrics = ChatTokenStreamMetrics;
 
     fn metrics(&self) -> Self::Metrics {
-        Some(self.stream.metrics().clone())
+        let mut metrics = self.stream.metrics().clone();
+        metrics.decode_duration = Some(self.decode_duration);
+        Some(metrics)
     }
 }

@@ -148,6 +148,7 @@ impl StreamState {
             time_to_first_token,
             prefill_tokens_per_second,
             generate_tokens_per_second,
+            backend_generate_tokens_per_second: None,
             tokens_count_input: self.tokens_input,
             tokens_count_input_cached: self.tokens_input_cached,
             tokens_count_output: self.tokens_output,

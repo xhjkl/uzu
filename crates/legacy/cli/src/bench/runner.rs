@@ -84,6 +84,7 @@ impl BenchRunner {
             let mut time_to_first_token = 0.0f64;
             let mut prompt_tokens_per_second = 0.0f64;
             let mut generate_tokens_per_second = Vec::new();
+            let mut backend_generate_tokens_per_second = Vec::new();
             for reply in replies.iter() {
                 tokens_count_input += reply.stats.tokens_count_input.unwrap_or(0) as u64;
                 tokens_count_output += reply.stats.tokens_count_output.unwrap_or(0) as u64;
@@ -91,6 +92,9 @@ impl BenchRunner {
                 prompt_tokens_per_second += reply.stats.prefill_tokens_per_second.unwrap_or(0.0f64);
                 if let Some(value) = reply.stats.generate_tokens_per_second {
                     generate_tokens_per_second.push(value);
+                }
+                if let Some(value) = reply.stats.backend_generate_tokens_per_second {
+                    backend_generate_tokens_per_second.push(value);
                 }
             }
 
@@ -102,6 +106,7 @@ impl BenchRunner {
                 text = replies.last().unwrap().message.text();
             }
             let generate_tokens_per_second = mean(&generate_tokens_per_second);
+            let backend_generate_tokens_per_second = mean(&backend_generate_tokens_per_second);
 
             let power_stats_list =
                 replies.iter().filter_map(|reply| reply.stats.power_stats.as_ref()).collect::<Vec<_>>();
@@ -123,6 +128,7 @@ impl BenchRunner {
                 time_to_first_token,
                 prompt_tokens_per_second,
                 generate_tokens_per_second,
+                backend_generate_tokens_per_second,
                 power_stats,
                 joules_per_token,
                 text: text.unwrap_or("".to_string()),
