@@ -54,28 +54,16 @@ impl VariantBind {
         }
     }
 
-    pub fn struct_field(
+    pub fn struct_parts(
         &self,
         referenced_parameter_names: &BTreeSet<String>,
-    ) -> Option<TokenStream> {
+    ) -> Option<(TokenStream, TokenStream)> {
         let parsed_type = self.parsed_type.as_ref()?;
         if !referenced_parameter_names.contains(&self.parameter_name.to_string()) {
             return None;
         }
         let field_name = &self.field_name;
-        Some(quote! { #field_name: #parsed_type })
-    }
-
-    pub fn struct_initializer(
-        &self,
-        referenced_parameter_names: &BTreeSet<String>,
-    ) -> Option<TokenStream> {
-        self.parsed_type.as_ref()?;
-        if !referenced_parameter_names.contains(&self.parameter_name.to_string()) {
-            return None;
-        }
-        let field_name = &self.field_name;
         let parameter_name = &self.parameter_name;
-        Some(quote! { #field_name: #parameter_name })
+        Some((quote! { #field_name: #parsed_type }, quote! { #field_name: #parameter_name }))
     }
 }

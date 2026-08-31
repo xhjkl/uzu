@@ -19,7 +19,7 @@ pub enum ArgumentEmission {
     Buffer(BufferArgument),
     Constant(ConstantArgument),
     Shared(SharedArgument),
-    IndirectDispatch(IndirectDispatchArgument),
+    IndirectDispatch,
 }
 
 pub struct BufferArgument {
@@ -57,8 +57,6 @@ pub struct SharedArgument {
     length_expression: TokenStream,
 }
 
-pub struct IndirectDispatchArgument;
-
 pub fn parse(
     kernel: &MetalKernelInfo,
     enum_paths: &EnumPaths,
@@ -94,7 +92,7 @@ pub fn parse(
                 next_threadgroup_index += 1;
             },
             MetalArgumentType::Groups(MetalGroupsType::Indirect) if !indirect_dispatch_emitted => {
-                emissions.push(ArgumentEmission::IndirectDispatch(IndirectDispatchArgument));
+                emissions.push(ArgumentEmission::IndirectDispatch);
                 indirect_dispatch_emitted = true;
             },
             _ => {},
@@ -161,8 +159,8 @@ fn parse_constant_argument(
         .with_context(|| format!("constant rust type `{}` cannot be parsed", rust_type_text))?;
     let shape = match constant_type {
         MetalConstantType::Scalar => ConstantShape::Scalar(element_type),
-        MetalConstantType::Array(None) => ConstantShape::UnsizedSlice(element_type),
-        MetalConstantType::Array(Some(size_text)) => {
+        MetalConstantType::UnsizedArray => ConstantShape::UnsizedSlice(element_type),
+        MetalConstantType::SizedArray(size_text) => {
             let size: Expr = syn::parse_str(size_text)
                 .with_context(|| format!("constant array size `{}` cannot be parsed", size_text))?;
             ConstantShape::SizedArray {
@@ -200,17 +198,11 @@ fn parse_argument_condition(
 }
 
 impl ArgumentEmission {
-    pub fn struct_field(&self) -> Option<TokenStream> {
-        let condition = self.condition()?;
-        let field_name = &condition.field_name;
-        Some(quote! { #field_name: bool })
-    }
-
-    pub fn struct_initializer(&self) -> Option<TokenStream> {
+    pub fn struct_parts(&self) -> Option<(TokenStream, TokenStream)> {
         let condition = self.condition()?;
         let field_name = &condition.field_name;
         let rust_expression = &condition.rust_expression;
-        Some(quote! { #field_name: #rust_expression })
+        Some((quote! { #field_name: bool }, quote! { #field_name: #rust_expression }))
     }
 
     pub fn encode_argument_definition(&self) -> Option<TokenStream> {
@@ -218,7 +210,7 @@ impl ArgumentEmission {
             ArgumentEmission::Buffer(buffer) => Some(emit_buffer_argument_definition(buffer)),
             ArgumentEmission::Constant(constant) => Some(emit_constant_argument_definition(constant)),
             ArgumentEmission::Shared(_) => None,
-            ArgumentEmission::IndirectDispatch(_) => Some(quote! {
+            ArgumentEmission::IndirectDispatch => Some(quote! {
                 __dsl_indirect_dispatch_buffer: impl crate::backends::common::BufferArg<
                     '__dsl_indirect_dispatch_buffer, crate::backends::metal::Metal
                 >
@@ -232,7 +224,7 @@ impl ArgumentEmission {
                 let lifetime = &buffer.lifetime;
                 Some(quote! { #lifetime })
             },
-            ArgumentEmission::IndirectDispatch(_) => Some(quote! { '__dsl_indirect_dispatch_buffer }),
+            ArgumentEmission::IndirectDispatch => Some(quote! { '__dsl_indirect_dispatch_buffer }),
             ArgumentEmission::Constant(_) | ArgumentEmission::Shared(_) => None,
         }
     }
@@ -247,7 +239,7 @@ impl ArgumentEmission {
                     quote! { let #name = #name.into_parts(); }
                 })
             },
-            ArgumentEmission::IndirectDispatch(_) => Some(quote! {
+            ArgumentEmission::IndirectDispatch => Some(quote! {
                 let __dsl_indirect_dispatch_buffer = __dsl_indirect_dispatch_buffer.into_parts();
             }),
             ArgumentEmission::Constant(_) | ArgumentEmission::Shared(_) => None,
@@ -257,7 +249,7 @@ impl ArgumentEmission {
     pub fn encode_access(&self) -> Option<TokenStream> {
         match self {
             ArgumentEmission::Buffer(buffer) => Some(emit_buffer_access(buffer)),
-            ArgumentEmission::IndirectDispatch(_) => Some(quote! {
+            ArgumentEmission::IndirectDispatch => Some(quote! {
                 Some(crate::backends::common::Access {
                     range: __dsl_indirect_dispatch_buffer.0.gpu_address_subrange(
                         (__dsl_indirect_dispatch_buffer.1)..(__dsl_indirect_dispatch_buffer.1 + 12),
@@ -274,7 +266,7 @@ impl ArgumentEmission {
             ArgumentEmission::Buffer(buffer) => emit_buffer_set(buffer),
             ArgumentEmission::Constant(constant) => emit_constant_set(constant),
             ArgumentEmission::Shared(shared) => emit_shared_set(shared),
-            ArgumentEmission::IndirectDispatch(_) => quote! {},
+            ArgumentEmission::IndirectDispatch => quote! {},
         }
     }
 
@@ -283,7 +275,7 @@ impl ArgumentEmission {
             ArgumentEmission::Buffer(buffer) => buffer.condition.as_ref(),
             ArgumentEmission::Constant(constant) => constant.condition.as_ref(),
             ArgumentEmission::Shared(shared) => Some(&shared.condition),
-            ArgumentEmission::IndirectDispatch(_) => None,
+            ArgumentEmission::IndirectDispatch => None,
         }
     }
 }

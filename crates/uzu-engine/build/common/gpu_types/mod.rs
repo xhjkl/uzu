@@ -1,4 +1,5 @@
-#![allow(unused)]
+#![cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code, unused_imports))]
+
 use std::{
     borrow::Borrow,
     env, fs,
@@ -17,7 +18,7 @@ mod item_struct;
 
 pub use item_constant::GpuTypeConstant;
 pub use item_enum::GpuTypeEnum;
-pub use item_option_set::{GpuTypeOptionSet, GpuTypeOptionSetVariant};
+pub use item_option_set::GpuTypeOptionSet;
 pub use item_struct::{GpuTypeStruct, GpuTypeStructFieldType};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, From, AsRef, Deref, Display)]
@@ -76,7 +77,8 @@ impl GpuTypeFile {
                 Item::Enum(item) => Some(GpuTypeEnum::parse(item).map(GpuType::Enum)),
                 Item::Struct(item) => Some(GpuTypeStruct::parse(item).map(GpuType::Struct)),
                 Item::Macro(item) if item.mac.path.is_ident("bitflags") => {
-                    Some(GpuTypeOptionSet::parse(item.mac.tokens).map(GpuType::OptionSet))
+                    let option_set = syn::parse2(item.mac.tokens).context("Cannot parse bitflags! contents");
+                    Some(option_set.map(GpuType::OptionSet))
                 },
                 _ => None,
             })

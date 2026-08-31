@@ -13,6 +13,8 @@ mod metal;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<ExitCode> {
+    debug_log!("build script started");
+
     println!("cargo::rerun-if-changed=build");
 
     if envs::build_always() {
@@ -39,8 +41,6 @@ async fn main() -> anyhow::Result<ExitCode> {
     if grammar {
         println!("cargo::rustc-cfg=grammar");
     }
-
-    debug_log!("build script started");
 
     if envs::build_clean() {
         let out_dir = PathBuf::from(env::var("OUT_DIR").context("missing OUT_DIR")?);

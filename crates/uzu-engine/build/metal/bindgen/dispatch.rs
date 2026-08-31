@@ -10,15 +10,10 @@ use super::{
     host_expression_rewriter::HostExpressionRewriter,
 };
 
-pub struct DispatchEmission {
-    pub dispatch_code: TokenStream,
-    pub empty_dispatch_guards: TokenStream,
-}
-
 pub fn parse(
     kernel: &MetalKernelInfo,
     host_expression_rewriter: &mut HostExpressionRewriter,
-) -> Result<DispatchEmission> {
+) -> Result<(TokenStream, TokenStream)> {
     let (dispatch_code, dispatch_size_expressions) = if kernel.has_axis() {
         if kernel.has_groups() || kernel.has_threads() {
             bail!("mixing groups/threads and axis is not supported");
@@ -35,10 +30,7 @@ pub fn parse(
 
     let empty_dispatch_guards = build_empty_dispatch_guards(&dispatch_size_expressions);
 
-    Ok(DispatchEmission {
-        dispatch_code,
-        empty_dispatch_guards,
-    })
+    Ok((dispatch_code, empty_dispatch_guards))
 }
 
 fn build_axis_dispatch(

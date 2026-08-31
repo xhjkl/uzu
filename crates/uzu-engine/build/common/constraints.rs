@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rhai::EvalAltResult;
 use rhai::{AST, Dynamic, Engine, Module, Scope};
 
-fn unqualify_variant(value: &str) -> &str {
+pub fn unqualify_variant(value: &str) -> &str {
     value.rsplit("::").next().unwrap_or(value)
 }
 
@@ -19,33 +19,33 @@ pub struct Constraints {
 }
 
 impl Constraints {
-    pub fn new<'a>(
-        variant_values: impl IntoIterator<Item = &'a str>,
-        constraints: &[impl AsRef<str>],
+    pub fn new(
+        variant_values: impl IntoIterator<Item = impl AsRef<str>>,
+        constraints: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Self {
         let mut engine = Engine::new();
-        let mut namespaces: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut namespaces: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for value in variant_values {
-            if let Some((namespace, name)) = value.rsplit_once("::") {
-                namespaces.entry(namespace).or_default().insert(name);
+            if let Some((namespace, name)) = value.as_ref().rsplit_once("::") {
+                namespaces.entry(namespace.to_owned()).or_default().insert(name.to_owned());
             }
         }
         for (namespace, names) in namespaces {
             let mut module = Module::new();
             for name in names {
-                module.set_var(name, name.to_string());
+                module.set_var(name.clone(), name);
             }
             engine.register_static_module(namespace, module.into());
         }
         let constraints = constraints
-            .iter()
+            .into_iter()
             .map(|constraint| {
-                let source = constraint.as_ref();
+                let source: Box<str> = constraint.as_ref().into();
                 let ast = engine
-                    .compile_expression(source)
+                    .compile_expression(&source)
                     .unwrap_or_else(|error| panic!("constraint `{source}` failed to compile: {error}"));
                 Constraint {
-                    source: source.into(),
+                    source,
                     ast,
                 }
             })
@@ -56,15 +56,21 @@ impl Constraints {
         }
     }
 
-    fn scope<N: AsRef<str>, V: AsRef<str>>(
+    fn scope<N, V>(
         &self,
-        bindings: &[(N, V)],
-    ) -> Scope<'static> {
-        let mut scope = Scope::with_capacity(bindings.len());
+        bindings: impl IntoIterator<Item = (N, V)>,
+    ) -> Scope<'static>
+    where
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let bindings = bindings.into_iter();
+        let mut scope = Scope::with_capacity(bindings.size_hint().0);
         for (name, val) in bindings {
+            let name = name.as_ref();
             let val = unqualify_variant(val.as_ref());
             scope.push(
-                name.as_ref().to_owned(),
+                name.to_owned(),
                 self.engine.eval_expression::<Dynamic>(val).unwrap_or_else(|_| val.to_owned().into()),
             );
         }
@@ -72,10 +78,14 @@ impl Constraints {
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    pub fn could_satisfy<N: AsRef<str>, V: AsRef<str>>(
+    pub fn could_satisfy<N, V>(
         &self,
-        bindings: &[(N, V)],
-    ) -> bool {
+        bindings: impl IntoIterator<Item = (N, V)>,
+    ) -> bool
+    where
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
         let mut scope = self.scope(bindings);
         self.constraints.iter().all(|constraint| {
             match self.engine.eval_ast_with_scope::<bool>(&mut scope, &constraint.ast) {
@@ -86,10 +96,14 @@ impl Constraints {
         })
     }
 
-    pub fn satisfied<N: AsRef<str>, V: AsRef<str>>(
+    pub fn satisfied<N, V>(
         &self,
-        bindings: &[(N, V)],
-    ) -> bool {
+        bindings: impl IntoIterator<Item = (N, V)>,
+    ) -> bool
+    where
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
         let mut scope = self.scope(bindings);
         self.constraints.iter().all(|constraint| {
             self.engine

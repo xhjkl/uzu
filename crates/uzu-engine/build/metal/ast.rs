@@ -38,7 +38,7 @@ fn expand_integer_defines_in_threadgroup_dimension(
     quote!(#expr).to_string().into_boxed_str()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct MetalAstType {
     #[serde(rename = "qualType")]
     qual_type: Box<str>,
@@ -46,7 +46,7 @@ pub struct MetalAstType {
     desugared_qual_type: Option<Box<str>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub enum MetalAstKind {
     TranslationUnitDecl,
     FunctionTemplateDecl,
@@ -127,19 +127,20 @@ pub enum MetalBufferAccess {
     ReadWrite,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum MetalConstantType {
     Scalar,
-    Array(Option<Box<str>>),
+    UnsizedArray,
+    SizedArray(Box<str>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum MetalGroupsType {
     Direct(Box<str>),
     Indirect,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum MetalArgumentType {
     Buffer(MetalBufferAccess),
     Constant((Box<str>, MetalConstantType)),
@@ -234,11 +235,7 @@ impl MetalArgument {
             bail!("more than one annotation on argument ast node");
         }
 
-        let annotation = if let Some(annotation_node) = argument_node.inner.first() {
-            Some(annotation_from_ast_node(annotation_node.clone())?)
-        } else {
-            None
-        };
+        let annotation = argument_node.inner.into_iter().next().map(annotation_from_ast_node).transpose()?;
 
         let start_offset = range.begin.spelling_loc.context("no start location in source range")?.offset;
         let end_offset = range.end.spelling_loc.context("no end location in source range")?.offset;
@@ -264,10 +261,6 @@ impl MetalArgument {
             }),
             _ => None,
         }
-    }
-
-    pub fn is_optional_shared(&self) -> bool {
-        matches!(self.argument_type, MetalArgumentType::Shared(_)) && self.condition.is_some()
     }
 }
 
@@ -304,41 +297,38 @@ fn parse_argument_type(
     integer_defines: &IntegerObjectDefines,
 ) -> anyhow::Result<MetalArgumentType> {
     if let Some(annotation) = annotation {
-        let mut annotation = annotation.to_vec();
-        if annotation.is_empty() {
+        let Some((annotation_key, arguments)) = annotation.split_first() else {
             bail!("empty annotation");
-        }
-        let annotation_key = annotation.remove(0);
+        };
 
-        return match &*annotation_key {
+        return match annotation_key.as_ref() {
             "dsl.specialize" => {
-                if !annotation.is_empty() {
-                    bail!("dsl.specialize takes no arguments, got {}", annotation.len());
+                if !arguments.is_empty() {
+                    bail!("dsl.specialize takes no arguments, got {}", arguments.len());
                 }
                 let rust_type = MetalArgument::scalar_type_to_rust(c_type)?;
                 Ok(MetalArgumentType::Specialize(rust_type))
             },
             "dsl.axis" => {
-                if annotation.len() != 2 {
-                    bail!("dsl.axis requires 2 arguments, got {}", annotation.len());
-                }
-                Ok(MetalArgumentType::Axis(annotation.remove(0), annotation.remove(0)))
+                let [threads, threads_per_group] = arguments else {
+                    bail!("dsl.axis requires 2 arguments, got {}", arguments.len());
+                };
+                Ok(MetalArgumentType::Axis(threads.clone(), threads_per_group.clone()))
             },
             "dsl.groups" => {
-                if annotation.len() != 1 {
-                    bail!("dsl.groups requires 1 argument, got {}", annotation.len());
-                }
-                let dim = annotation.remove(0);
+                let [dim] = arguments else {
+                    bail!("dsl.groups requires 1 argument, got {}", arguments.len());
+                };
                 match dim.as_ref() {
                     "INDIRECT" => Ok(MetalArgumentType::Groups(MetalGroupsType::Indirect)),
-                    _ => Ok(MetalArgumentType::Groups(MetalGroupsType::Direct(dim))),
+                    _ => Ok(MetalArgumentType::Groups(MetalGroupsType::Direct(dim.clone()))),
                 }
             },
             "dsl.threads" => {
-                if annotation.len() != 1 {
-                    bail!("dsl.threads requires 1 argument, got {}", annotation.len());
-                }
-                Ok(MetalArgumentType::Threads(annotation.remove(0)))
+                let [threads] = arguments else {
+                    bail!("dsl.threads requires 1 argument, got {}", arguments.len());
+                };
+                Ok(MetalArgumentType::Threads(threads.clone()))
             },
             _ => bail!("unknown annotation: {annotation_key}"),
         };
@@ -364,18 +354,15 @@ fn parse_argument_type(
     }
 
     if let ["const", "constant", c_type_scalar, "*"] = c_type.split_whitespace().collect::<Vec<_>>().as_slice() {
-        let size = if source.contains('[') && source.contains(']') {
+        let constant_type = if source.contains('[') && source.contains(']') {
             let lbracket = source.rfind('[').context("sized constant missing size bracket")? + 1;
             let rbracket = source.rfind(']').context("sized constant missing size bracket")?;
-            Some(source[lbracket..rbracket].into())
+            MetalConstantType::SizedArray(source[lbracket..rbracket].into())
         } else {
-            None
+            MetalConstantType::UnsizedArray
         };
 
-        return Ok(MetalArgumentType::Constant((
-            MetalArgument::scalar_type_to_rust(c_type_scalar)?,
-            MetalConstantType::Array(size),
-        )));
+        return Ok(MetalArgumentType::Constant((MetalArgument::scalar_type_to_rust(c_type_scalar)?, constant_type)));
     }
 
     if c_type.contains("threadgroup") && c_type.contains('*') {
@@ -495,12 +482,12 @@ impl MetalKernelInfo {
                         conditional: a.condition.is_some(),
                         ty: KernelArgumentType::Constant(ty.clone()),
                     }),
-                    MetalArgumentType::Constant((ty, MetalConstantType::Array(None))) => Some(KernelArgument {
+                    MetalArgumentType::Constant((ty, MetalConstantType::UnsizedArray)) => Some(KernelArgument {
                         name: a.name.clone(),
                         conditional: a.condition.is_some(),
                         ty: KernelArgumentType::Constant(format!("&[{ty}]").into_boxed_str()),
                     }),
-                    MetalArgumentType::Constant((ty, MetalConstantType::Array(Some(size)))) => Some(KernelArgument {
+                    MetalArgumentType::Constant((ty, MetalConstantType::SizedArray(size))) => Some(KernelArgument {
                         name: a.name.clone(),
                         conditional: a.condition.is_some(),
                         ty: KernelArgumentType::Constant(format!("&[{ty}; {size}]").into_boxed_str()),
@@ -579,12 +566,9 @@ impl MetalKernelInfo {
         let annotations = annotations
             .into_iter()
             .map(|a| {
-                if !a.is_empty() {
-                    let mut a = a.into_vec();
-                    Ok((a.remove(0), a.into_boxed_slice()))
-                } else {
-                    bail!("zero length annotation");
-                }
+                let mut values = a.into_vec().into_iter();
+                let key = values.next().context("zero length annotation")?;
+                Ok((key, values.collect::<Box<[Box<str>]>>()))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 

@@ -7,7 +7,6 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
-use itertools::{Itertools, izip};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -15,10 +14,9 @@ use walkdir::WalkDir;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::{
-    ast::MetalKernelInfo,
     bindgen::bindgen_global,
     toolchain::MetalToolchain,
-    wrapper::{KernelWrappers, VariantWrapper, wrappers},
+    wrapper::{KernelWrappers, wrappers},
 };
 use crate::{
     common::{
@@ -32,20 +30,6 @@ use crate::{
 const MIN_VARIANTS_PER_SHARD: usize = 8;
 const MAX_VARIANTS_PER_SHARD: usize = 64;
 
-fn cargo_parallelism() -> usize {
-    let available = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
-    let Ok(num_jobs) = env::var("NUM_JOBS") else {
-        return available;
-    };
-    let Ok(num_jobs) = num_jobs.parse::<usize>() else {
-        return available;
-    };
-    if num_jobs == 0 {
-        return available;
-    }
-    num_jobs.min(available)
-}
-
 fn shard_footers(kernel_wrappers: &[KernelWrappers]) -> Vec<String> {
     let total_variants: usize = kernel_wrappers.iter().map(|kernel| kernel.variants.len()).sum();
     let min_shards = total_variants.div_ceil(MAX_VARIANTS_PER_SHARD);
@@ -58,26 +42,22 @@ fn shard_footers(kernel_wrappers: &[KernelWrappers]) -> Vec<String> {
     };
 
     let mut footers = vec![String::new(); num_shards];
-    for kernel in kernel_wrappers {
-        let mut emit = |index: usize, variants: Vec<&VariantWrapper>| {
-            let footer = &mut footers[index];
-            footer.push_str(kernel.header.as_deref().unwrap_or(""));
-            footer.push_str(&variants.iter().map(|variant| variant.source.as_ref()).join(""));
-            footer.push_str(kernel.footer.as_deref().unwrap_or(""));
-        };
-
-        if num_shards == 1 {
-            emit(0, kernel.variants.iter().collect());
-        } else {
-            for (index, variants) in kernel
+    for (index, footer) in footers.iter_mut().enumerate() {
+        for kernel in kernel_wrappers {
+            let mut variants = kernel
                 .variants
                 .iter()
-                .into_group_map_by(|variant| (xxh3_64(variant.name.as_bytes()) % num_shards as u64) as usize)
-                .into_iter()
-                .sorted_unstable_by_key(|(index, _)| *index)
-            {
-                emit(index, variants);
+                .filter(|variant| (xxh3_64(variant.name.as_bytes()) % num_shards as u64) as usize == index)
+                .peekable();
+            if variants.peek().is_none() {
+                continue;
             }
+
+            footer.push_str(kernel.header.as_deref().unwrap_or(""));
+            for variant in variants {
+                footer.push_str(&variant.source);
+            }
+            footer.push_str(kernel.footer.as_deref().unwrap_or(""));
         }
     }
     footers
@@ -89,19 +69,14 @@ struct Cached {
     dependency_hashes: HashMap<Box<str>, [u8; blake3::OUT_LEN]>,
     public_kernels: Box<[Kernel]>,
     has_kernels: bool,
-    num_variants: usize,
-    num_shards: usize,
 }
 
 #[derive(Debug)]
 pub struct MetalCompiler {
     source_directory: PathBuf,
-    gpu_types_directory: PathBuf,
     output_directory: PathBuf,
     metallib_compressed: bool,
     toolchain: MetalToolchain,
-    build_permits: Semaphore,
-    num_parallel_jobs: usize,
     cache_key: [u8; blake3::OUT_LEN],
 }
 
@@ -117,16 +92,13 @@ impl MetalCompiler {
         fs::create_dir_all(&output_directory)
             .with_context(|| format!("cannot create {}", output_directory.display()))?;
 
-        let metallib_compressed = match env::var("OPT_LEVEL").context("missing OPT_LEVEL")?.as_str() {
+        let opt_level = env::var("OPT_LEVEL").context("missing OPT_LEVEL")?;
+        let metallib_compressed = match opt_level.as_str() {
             "0" | "1" | "2" => false, // treat opt-level 0/1/2 as debug/test build where size doesn't matter
             _ => true,                // treat everything else (3,s,z) as release build where size matters
         };
 
-        let toolchain = MetalToolchain::from_env_with_include_dir(Some(gpu_types_directory.clone()))
-            .await
-            .context("cannot create toolchain")?;
-        let num_parallel_jobs = cargo_parallelism();
-        let build_permits = Semaphore::new(num_parallel_jobs);
+        let toolchain = MetalToolchain::new(gpu_types_directory).await.context("cannot create toolchain")?;
 
         let cache_key = {
             let build_system_hash = caching::build_system_hash().context("cannot get build system hash")?;
@@ -141,12 +113,9 @@ impl MetalCompiler {
 
         Ok(Self {
             source_directory,
-            gpu_types_directory,
             output_directory,
             metallib_compressed,
             toolchain,
-            build_permits,
-            num_parallel_jobs,
             cache_key,
         })
     }
@@ -164,6 +133,7 @@ impl MetalCompiler {
         &self,
         source_path: PathBuf,
         enum_paths: &EnumPaths,
+        build_permits: &Semaphore,
     ) -> anyhow::Result<(KernelPath, Box<[Kernel]>, bool)> {
         let source_path_relative =
             source_path.strip_prefix(&self.source_directory).context("source is not in src_dir")?;
@@ -193,24 +163,18 @@ impl MetalCompiler {
             for path in cached.dependency_hashes.keys() {
                 self.emit_rerun_if_changed_for_dependency(path);
             }
-            let sharding = if cached.has_kernels {
-                format!(" ({} variants / {} shards)", cached.num_variants, cached.num_shards)
-            } else {
-                Default::default()
-            };
-            debug_log!("compile cached: {source_path_relative_str}{sharding}");
+            debug_log!("compile cached: {source_path_relative_str}");
             return Ok((kernel_path, cached.public_kernels, cached.has_kernels));
         }
 
-        let permit = self.build_permits.acquire().await.context("build semaphore closed")?;
+        let permit = build_permits.acquire().await.expect("build semaphore is local and never closed");
         let analysis = self.toolchain.analyze(&source_path).await;
         drop(permit);
-        let (metal_kernel_infos, dependencies) =
+        let (kernel_infos, dependencies) =
             analysis.with_context(|| format!("cannot analyze {source_path_relative_str}"))?;
 
-        let kernel_infos: Vec<MetalKernelInfo> = metal_kernel_infos.collect();
-
         let dependency_hashes = dependencies
+            .into_iter()
             .map(|path| {
                 self.emit_rerun_if_changed_for_dependency(&path);
                 Ok((
@@ -231,38 +195,35 @@ impl MetalCompiler {
             let footers = shard_footers(&kernel_wrappers);
             num_shards = footers.len();
 
-            let metallib_files: Vec<PathBuf> = match num_shards {
-                1 => vec![output_base_path.with_extension("metallib")],
-                num_shards => {
-                    (0..num_shards).map(|i| output_base_path.with_extension(format!("shard{i}.metallib"))).collect()
-                },
-            };
-
-            let metallib_maybe_compressed_files: Vec<PathBuf> = metallib_files
-                .iter()
-                .map(|file| {
-                    if self.metallib_compressed {
-                        file.with_added_extension("zst")
+            let artifacts = (0..num_shards)
+                .map(|index| {
+                    let metallib_file = if num_shards == 1 {
+                        output_base_path.with_extension("metallib")
                     } else {
-                        file.clone()
-                    }
+                        output_base_path.with_extension(format!("shard{index}.metallib"))
+                    };
+                    let embedded_file = if self.metallib_compressed {
+                        metallib_file.with_added_extension("zst")
+                    } else {
+                        metallib_file.clone()
+                    };
+                    (metallib_file, embedded_file)
                 })
-                .collect();
+                .collect::<Vec<_>>();
 
-            let compile_outputs = try_join_all(izip!(&footers, &metallib_files, &metallib_maybe_compressed_files).map(
-                |(footer, metallib_file, compressed_file)| {
+            let compile_outputs =
+                try_join_all(footers.iter().zip(&artifacts).map(|(footer, (metallib_file, embedded_file))| {
                     let source_path = &source_path;
                     async move {
-                        let permit = self.build_permits.acquire().await.context("build semaphore closed")?;
-                        let warnings = self.toolchain.compile(source_path, footer, metallib_file).await;
-                        let warnings = warnings?;
+                        let permit = build_permits.acquire().await.expect("build semaphore is local and never closed");
+                        let warnings = self.toolchain.compile(source_path, footer, metallib_file).await?;
 
                         if self.metallib_compressed {
                             let metallib_file = metallib_file.clone();
-                            let compressed_file = compressed_file.clone();
+                            let embedded_file = embedded_file.clone();
                             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 let metallib_source = fs::read(metallib_file)?;
-                                fs::write(compressed_file, zstd::encode_all(metallib_source.as_slice(), 22)?)?;
+                                fs::write(embedded_file, zstd::encode_all(metallib_source.as_slice(), 22)?)?;
                                 Ok(())
                             })
                             .await??;
@@ -271,10 +232,9 @@ impl MetalCompiler {
                         drop(permit);
                         anyhow::Ok(warnings)
                     }
-                },
-            ))
-            .await
-            .with_context(|| format!("cannot compile {source_path_relative_str}"))?;
+                }))
+                .await
+                .with_context(|| format!("cannot compile {source_path_relative_str}"))?;
 
             for warnings in compile_outputs.into_iter().flatten() {
                 for line in warnings.lines() {
@@ -284,9 +244,9 @@ impl MetalCompiler {
 
             let library_const =
                 format_ident!("MTLB_{}", blake3::hash(source_path_relative_str.as_bytes()).to_hex().to_uppercase());
-            let metallib_file_strs = metallib_maybe_compressed_files
+            let metallib_file_strs = artifacts
                 .iter()
-                .map(|file| file.to_str().context("metallib path is not utf-8"))
+                .map(|(_metallib_file, embedded_file)| embedded_file.to_str().context("metallib path is not utf-8"))
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
             let bindings = kernel_infos
@@ -301,7 +261,6 @@ impl MetalCompiler {
                         self.metallib_compressed,
                     )
                     .with_context(|| format!("cannot generate bindings for {}", kernel.name))
-                    .map(|(tokens, _associated_type)| tokens)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -320,13 +279,11 @@ impl MetalCompiler {
         let cached = Cached {
             cache_key: self.cache_key,
             dependency_hashes,
-            public_kernels: public_kernels.clone(),
+            public_kernels,
             has_kernels,
-            num_variants,
-            num_shards,
         };
-        fs::write(&cached_file, serde_json::to_vec_pretty(&cached).context("cannot serialize cache")?)
-            .context("cannot write cache file")?;
+        let cached_contents = serde_json::to_vec_pretty(&cached).context("cannot serialize cache")?;
+        fs::write(&cached_file, cached_contents).context("cannot write cache file")?;
 
         let sharding = if has_kernels {
             format!(" ({num_variants} variants / {num_shards} shards)")
@@ -335,7 +292,7 @@ impl MetalCompiler {
         };
         debug_log!("compile end: {source_path_relative_str}{sharding}");
 
-        Ok((kernel_path, public_kernels, has_kernels))
+        Ok((kernel_path, cached.public_kernels, has_kernels))
     }
 }
 
@@ -346,7 +303,8 @@ impl Compiler for MetalCompiler {
         gpu_types: &GpuTypes,
         enum_paths: &EnumPaths,
     ) -> anyhow::Result<HashMap<KernelPath, Box<[Kernel]>>> {
-        gpu_type_gen(&self.gpu_types_directory, gpu_types).await.context("cannot generate shared gpu types")?;
+        gpu_type_gen(&self.source_directory.join("generated"), gpu_types)
+            .context("cannot generate shared gpu types")?;
 
         let metal_sources: Vec<PathBuf> = WalkDir::new(&self.source_directory)
             .into_iter()
@@ -355,15 +313,22 @@ impl Compiler for MetalCompiler {
             .map(|e| e.into_path())
             .collect();
 
-        let num_concurrent_sources = self.num_parallel_jobs.saturating_mul(2);
+        let available = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
+        let num_jobs = env::var("NUM_JOBS");
+        let num_jobs = num_jobs.ok().and_then(|value| value.parse().ok()).filter(|&value| value > 0);
+        let num_parallel_jobs = num_jobs.unwrap_or(available).min(available);
+        let build_permits = Semaphore::new(num_parallel_jobs);
 
         let compiled: Vec<(KernelPath, Box<[Kernel]>, bool)> = stream::iter(metal_sources)
-            .map(|path| async move {
-                self.compile(path.clone(), enum_paths)
-                    .await
-                    .with_context(|| format!("cannot compile {}", path.display()))
+            .map(|path| {
+                let build_permits = &build_permits;
+                async move {
+                    self.compile(path.clone(), enum_paths, build_permits)
+                        .await
+                        .with_context(|| format!("cannot compile {}", path.display()))
+                }
             })
-            .buffer_unordered(num_concurrent_sources)
+            .buffer_unordered(num_parallel_jobs.saturating_mul(2))
             .try_collect()
             .await?;
 

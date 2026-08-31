@@ -1,19 +1,12 @@
-use std::path::Path;
+use std::{fs, iter::once, path::Path};
 
 use anyhow::Context;
 use itertools::Itertools;
 
-use crate::common::gpu_types::{GpuType, GpuTypeFile, GpuTypes};
-
-mod gpu_type_constant;
-mod gpu_type_enum;
-mod gpu_type_option_set;
-mod gpu_type_struct;
-
-use gpu_type_constant::gpu_type_gen_constant;
-use gpu_type_enum::gpu_type_gen_enum;
-use gpu_type_option_set::gpu_type_gen_option_set;
-use gpu_type_struct::gpu_type_gen_struct;
+use crate::common::gpu_types::{
+    GpuType, GpuTypeConstant, GpuTypeEnum, GpuTypeFile, GpuTypeOptionSet, GpuTypeStruct, GpuTypeStructFieldType,
+    GpuTypes,
+};
 
 fn rust_to_metal(ty: &str) -> anyhow::Result<&'static str> {
     match ty {
@@ -31,20 +24,19 @@ fn rust_to_metal(ty: &str) -> anyhow::Result<&'static str> {
     }
 }
 
-pub async fn gpu_type_gen(
+pub fn gpu_type_gen(
     gpu_types_dir: &Path,
     gpu_types: &GpuTypes,
 ) -> anyhow::Result<()> {
     for gpu_type_file in &gpu_types.files {
         gpu_type_gen_file(&gpu_types_dir.join(gpu_type_file.name.as_ref()).with_extension("h"), gpu_type_file)
-            .await
             .with_context(|| format!("Cannot generate gpu types for {}", gpu_type_file.name.as_ref()))?;
     }
 
     Ok(())
 }
 
-async fn gpu_type_gen_file(
+fn gpu_type_gen_file(
     file_path: &Path,
     gpu_types_file: &GpuTypeFile,
 ) -> anyhow::Result<()> {
@@ -56,8 +48,7 @@ async fn gpu_type_gen_file(
         .map(|gpu_type| match gpu_type {
             GpuType::Constant(gpu_type_constant) => gpu_type_gen_constant(gpu_type_constant)
                 .with_context(|| format!("Failed to generate bindings for {gpu_type_constant:?}")),
-            GpuType::Enum(gpu_type_enum) => gpu_type_gen_enum(gpu_type_enum)
-                .with_context(|| format!("Failed to generate bindings for {gpu_type_enum:?}")),
+            GpuType::Enum(gpu_type_enum) => Ok(gpu_type_gen_enum(gpu_type_enum)),
             GpuType::Struct(gpu_type_struct) => gpu_type_gen_struct(gpu_type_struct)
                 .with_context(|| format!("Failed to generate bindings for {gpu_type_struct:?}")),
             GpuType::OptionSet(gpu_type_option_set) => gpu_type_gen_option_set(gpu_type_option_set)
@@ -68,9 +59,61 @@ async fn gpu_type_gen_file(
     let new_contents = format!(include_str!("template.ht"), module_name = module_name, generated = generated);
 
     // Avoid advancing mtime if the contents are the same
-    if !tokio::fs::read(&file_path).await.is_ok_and(|old_contents| old_contents == new_contents.as_bytes()) {
-        tokio::fs::write(&file_path, new_contents).await.context("cannot write output")?;
+    let old_contents = fs::read(file_path);
+    if !old_contents.is_ok_and(|old_contents| old_contents == new_contents.as_bytes()) {
+        fs::write(file_path, new_contents).context("cannot write output")?;
     }
 
     Ok(())
+}
+
+fn gpu_type_gen_constant(constant: &GpuTypeConstant) -> anyhow::Result<String> {
+    let ty = rust_to_metal(&constant.ty)?;
+    Ok(format!("static constant constexpr {ty} {} = {};", constant.name, constant.value_expression))
+}
+
+fn gpu_type_gen_enum(gpu_type_enum: &GpuTypeEnum) -> String {
+    once(format!("enum class {} : uint32_t {{", gpu_type_enum.name.as_ref()))
+        .chain(gpu_type_enum.variants.iter().map(|variant| format!("  {} = {},", variant.name, variant.discriminant)))
+        .chain(once("};".into()))
+        .join("\n")
+}
+
+fn gpu_type_gen_struct(gpu_type_struct: &GpuTypeStruct) -> anyhow::Result<String> {
+    once(Ok("typedef struct {".into()))
+        .chain(gpu_type_struct.fields.iter().map(|field| match &field.ty {
+            GpuTypeStructFieldType::Scalar(ty) => Ok(format!("  {} {};", rust_to_metal(ty.as_ref())?, field.name)),
+            GpuTypeStructFieldType::Array {
+                element,
+                length,
+            } => Ok(format!("  {} {}[{}];", rust_to_metal(element.as_ref())?, field.name, *length)),
+        }))
+        .chain(once(Ok(format!("}} {};", gpu_type_struct.name.as_ref()))))
+        .process_results(|mut it| it.join("\n"))
+}
+
+fn gpu_type_gen_option_set(option_set: &GpuTypeOptionSet) -> anyhow::Result<String> {
+    let name = &option_set.name;
+    let underlying_c = rust_to_metal(&option_set.underlying_type)?;
+
+    let variants = option_set
+        .variants
+        .iter()
+        .map(|(name, value_expression)| {
+            format!("  static constant constexpr {underlying_c} {name} = {value_expression};\n")
+        })
+        .collect::<String>();
+
+    Ok(format!(
+        "struct {name} {{\n\
+         \x20 {underlying_c} raw_value;\n\
+         \x20 constexpr {name}() thread : raw_value(0) {{}}\n\
+         \x20 constexpr {name}({underlying_c} __dsl_v) thread : raw_value(__dsl_v) {{}}\n\
+         {variants}\
+         \x20 constexpr bool contains({underlying_c} flag) const thread {{ return (raw_value & flag) != 0; }}\n\
+         \x20 constexpr bool contains({underlying_c} flag) const constant {{ return (raw_value & flag) != 0; }}\n\
+         \x20 constexpr {underlying_c} bits() const thread {{ return raw_value; }}\n\
+         \x20 constexpr {underlying_c} bits() const constant {{ return raw_value; }}\n\
+         }};"
+    ))
 }

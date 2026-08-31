@@ -5,7 +5,7 @@ use itertools::Itertools;
 
 use super::{
     ast::{MetalArgument, MetalArgumentType, MetalKernelInfo, shared_element_type},
-    enum_path_rewrite::is_enum_c_type,
+    enum_path_rewrite::gpu_type_kind_for_c_type,
     variant_combinations::constrained_combinations,
 };
 use crate::common::{enum_paths::EnumPaths, identifiers::KernelName, mangling::static_mangle};
@@ -48,31 +48,23 @@ pub fn wrappers(
 
 struct SpecializeBinding<'a> {
     argument: &'a MetalArgument,
-    name_suffix: String,
-    enum_type: Option<String>,
+    kernel_name: &'a str,
+    enum_type: Option<&'a str>,
 }
 
 impl SpecializeBinding<'_> {
     fn slot_name(&self) -> String {
-        format!("__dsl_specialize_{}", self.name_suffix)
+        format!("__dsl_specialize_{}_{}", self.kernel_name, self.argument.name)
     }
 
     fn typed_name(&self) -> String {
-        format!("__dsl_typed_{}", self.name_suffix)
+        format!("__dsl_typed_{}_{}", self.kernel_name, self.argument.name)
     }
 
     fn slot_type(&self) -> &str {
         match self.enum_type {
             Some(_) => "uint32_t",
             None => self.argument.c_type.trim_start_matches("const ").trim(),
-        }
-    }
-
-    fn alias_target(&self) -> String {
-        if self.enum_type.is_some() {
-            self.typed_name()
-        } else {
-            self.slot_name()
         }
     }
 }
@@ -86,12 +78,12 @@ fn specialize_bindings<'a>(
         .iter()
         .filter(|a| matches!(&a.argument_type, MetalArgumentType::Specialize(_)))
         .map(|argument| {
-            let name_suffix = format!("{}_{}", kernel.name, argument.name);
-            let enum_type = is_enum_c_type(enum_paths, &argument.c_type)
-                .then(|| argument.c_type.trim_start_matches("const ").trim().to_string());
+            let enum_type = gpu_type_kind_for_c_type(enum_paths, &argument.c_type)
+                .is_some()
+                .then(|| argument.c_type.trim_start_matches("const ").trim());
             SpecializeBinding {
                 argument,
-                name_suffix,
+                kernel_name: &kernel.name,
                 enum_type,
             }
         })
@@ -114,7 +106,7 @@ fn kernel_header(
     }
 
     for binding in bindings.iter() {
-        if let Some(enum_type) = &binding.enum_type {
+        if let Some(enum_type) = binding.enum_type {
             lines.push(format!(
                 "constant {ty} {name} = {ty}({slot});",
                 ty = enum_type,
@@ -125,7 +117,12 @@ fn kernel_header(
     }
 
     for binding in bindings.iter() {
-        lines.push(format!("#define {} {}", binding.argument.name, binding.alias_target()));
+        let alias_target = if binding.enum_type.is_some() {
+            binding.typed_name()
+        } else {
+            binding.slot_name()
+        };
+        lines.push(format!("#define {} {alias_target}", binding.argument.name));
     }
 
     lines.push(String::new());
@@ -145,47 +142,44 @@ fn kernel_wrappers(
     let bindings = specialize_bindings(kernel, enum_paths);
 
     let header = base_index.map(|&base| kernel_header(&bindings, base).into_boxed_str());
+    let parameters = kernel.variants.as_deref().unwrap_or(&[]);
 
-    let type_variants = if let Some(variants) = &kernel.variants {
+    let type_variants: Vec<Box<[usize]>> = if !parameters.is_empty() {
         let constraints = crate::common::constraints::Constraints::new(
-            variants.iter().flat_map(|tp| tp.variants.iter().map(|variant| variant.as_ref())),
+            parameters.iter().flat_map(|tp| tp.variants.iter().map(|variant| variant.as_ref())),
             &kernel.constraints,
         );
-        let domain_lengths = variants.iter().map(|parameter| parameter.variants.len()).collect::<Vec<_>>();
+        let domain_lengths = parameters.iter().map(|parameter| parameter.variants.len()).collect::<Vec<_>>();
         constrained_combinations(&domain_lengths, |selection, complete| {
-            let bindings = variants
-                .iter()
-                .zip(selection)
-                .filter_map(|(parameter, value)| {
-                    value.map(|value| (parameter.name.as_ref(), parameter.variants[value].as_ref()))
-                })
-                .collect::<Vec<_>>();
+            let bindings = parameters.iter().zip(selection).filter_map(|(parameter, value)| {
+                value.map(|value| (parameter.name.as_ref(), parameter.variants[value].as_ref()))
+            });
             if complete {
-                constraints.satisfied(&bindings)
+                constraints.satisfied(bindings)
             } else {
-                constraints.could_satisfy(&bindings)
+                constraints.could_satisfy(bindings)
             }
         })
-        .into_iter()
-        .map(|selection| {
-            Some(
-                variants
-                    .iter()
-                    .zip(selection)
-                    .map(|(parameter, value)| (parameter.name.to_string(), parameter.variants[value].to_string()))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
     } else {
-        vec![None]
+        vec![Vec::new().into_boxed_slice()]
     };
 
     for type_variant in type_variants {
-        let (wrapper_name, underlying_name) = if let Some(type_variant) = &type_variant {
+        let (wrapper_name, underlying_name) = if !parameters.is_empty() {
             (
-                static_mangle(kernel.name.as_ref(), type_variant.iter().map(|(_k, v)| v.as_str())),
-                format!("{}<{}>", kernel.name, type_variant.iter().map(|(_k, v)| v).join(", ")),
+                static_mangle(
+                    kernel.name.as_ref(),
+                    parameters.iter().zip(&type_variant).map(|(parameter, &value)| &parameter.variants[value]),
+                ),
+                format!(
+                    "{}<{}>",
+                    kernel.name,
+                    parameters
+                        .iter()
+                        .zip(&type_variant)
+                        .map(|(parameter, &value)| &parameter.variants[value])
+                        .join(", ")
+                ),
             )
         } else {
             (static_mangle(kernel.name.as_ref(), [] as [&str; 0]), kernel.name.to_string())
@@ -223,7 +217,14 @@ fn kernel_wrappers(
             })
             .unzip();
 
-        for (threadgroup_index, argument) in optional_shared_arguments(kernel).enumerate() {
+        for (threadgroup_index, argument) in kernel
+            .arguments
+            .iter()
+            .filter(|argument| {
+                matches!(&argument.argument_type, MetalArgumentType::Shared(_)) && argument.condition.is_some()
+            })
+            .enumerate()
+        {
             let element_type = shared_element_type(&argument.c_type);
             wrapper_arguments.push(format!("{element_type}* {} [[threadgroup({threadgroup_index})]]", argument.name));
         }
@@ -297,10 +298,13 @@ fn kernel_wrappers(
         let wrapper_body =
             shared_definitions.chain(once(underlying_call)).map(|l| format!("  {l};\n")).collect::<Vec<_>>().join("");
 
-        let (defs, undefs): (Vec<_>, Vec<_>) = type_variant
-            .unwrap_or_default()
+        let (defs, undefs): (Vec<_>, Vec<_>) = parameters
             .iter()
-            .map(|(k, v)| (format!("\n#define {k} {v}"), format!("#undef {k}\n")))
+            .zip(&type_variant)
+            .map(|(parameter, &value)| {
+                let value = &parameter.variants[value];
+                (format!("\n#define {} {value}", parameter.name), format!("#undef {}\n", parameter.name))
+            })
             .unzip();
 
         let defs = defs.join("");
@@ -323,8 +327,4 @@ fn kernel_wrappers(
         variants: variants.into(),
         footer,
     })
-}
-
-fn optional_shared_arguments(kernel: &MetalKernelInfo) -> impl Iterator<Item = &MetalArgument> {
-    kernel.arguments.iter().filter(|argument| argument.is_optional_shared())
 }

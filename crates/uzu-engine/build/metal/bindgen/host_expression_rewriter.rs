@@ -7,13 +7,16 @@ use syn::Expr;
 
 use crate::{
     common::{enum_paths::EnumPaths, expr_rewrite::rewrite_paths_with},
-    metal::{bindgen::variants::VariantBind, enum_path_rewrite::qualify_enum_path},
+    metal::{
+        bindgen::{specialize::SpecializeEmission, variants::VariantBind},
+        enum_path_rewrite::qualify_enum_path,
+    },
 };
 
 pub struct HostExpressionRewriter<'context> {
     variants: &'context [VariantBind],
     enum_paths: &'context EnumPaths,
-    specialization_names: Vec<String>,
+    specializations: &'context SpecializeEmission,
     referenced_parameter_names: BTreeSet<String>,
     kernel_name: &'context str,
 }
@@ -22,13 +25,13 @@ impl<'context> HostExpressionRewriter<'context> {
     pub fn new(
         variants: &'context [VariantBind],
         enum_paths: &'context EnumPaths,
-        specialization_names: Vec<String>,
+        specializations: &'context SpecializeEmission,
         kernel_name: &'context str,
     ) -> Self {
         Self {
             variants,
             enum_paths,
-            specialization_names,
+            specializations,
             referenced_parameter_names: BTreeSet::new(),
             kernel_name,
         }
@@ -44,7 +47,7 @@ impl<'context> HostExpressionRewriter<'context> {
 
         let variants = self.variants;
         let enum_paths = self.enum_paths;
-        let specialization_names = &self.specialization_names;
+        let specializations = self.specializations;
         let referenced_parameter_names = &mut self.referenced_parameter_names;
         rewrite_paths_with(&mut expression, |path| {
             if let Some(qualified) = qualify_enum_path(path, enum_paths) {
@@ -61,7 +64,7 @@ impl<'context> HostExpressionRewriter<'context> {
             let name = path.segments[0].ident.to_string();
             let field_name = if let Some(variant) = variants.iter().find(|variant| variant.parameter_name == name) {
                 variant.field_name.clone()
-            } else if specialization_names.contains(&name) {
+            } else if specializations.contains_argument(&name) {
                 format_ident!("specialize_{name}")
             } else {
                 return None;

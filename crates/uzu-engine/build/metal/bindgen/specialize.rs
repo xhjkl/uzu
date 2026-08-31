@@ -28,11 +28,6 @@ pub struct SpecializeEmission {
     arguments: Vec<SpecializeArgument>,
 }
 
-pub struct RetainedSpecializations {
-    pub wrapper_fields: Vec<TokenStream>,
-    pub wrapper_initializers: Vec<TokenStream>,
-}
-
 pub fn parse(
     kernel: &MetalKernelInfo,
     base_function_constant_index: Option<usize>,
@@ -73,16 +68,18 @@ pub fn parse(
 }
 
 impl SpecializeEmission {
-    pub fn argument_names(&self) -> Vec<String> {
-        self.arguments.iter().map(|argument| argument.name.to_string()).collect()
+    pub fn contains_argument(
+        &self,
+        name: &str,
+    ) -> bool {
+        self.arguments.iter().any(|argument| argument.name == name)
     }
 
     pub fn retain_referenced(
         &self,
         referenced: &BTreeSet<String>,
-    ) -> RetainedSpecializations {
-        let (wrapper_fields, wrapper_initializers) = self
-            .arguments
+    ) -> (Vec<TokenStream>, Vec<TokenStream>) {
+        self.arguments
             .iter()
             .filter(|argument| referenced.contains(&argument.name.to_string()))
             .map(|argument| {
@@ -91,12 +88,7 @@ impl SpecializeEmission {
                 let rust_type = &argument.rust_type;
                 (quote! { #field: #rust_type }, quote! { #field: #name })
             })
-            .unzip();
-
-        RetainedSpecializations {
-            wrapper_fields,
-            wrapper_initializers,
-        }
+            .unzip()
     }
 
     pub fn constructor_arguments(&self) -> Vec<TokenStream> {

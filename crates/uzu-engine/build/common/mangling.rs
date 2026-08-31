@@ -6,9 +6,7 @@ use itertools::Itertools;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-pub fn unqualify_variant(value: &str) -> &str {
-    value.rsplit("::").next().unwrap_or(value)
-}
+use crate::common::constraints::unqualify_variant;
 
 pub fn static_mangle(
     function_name: impl AsRef<str>,

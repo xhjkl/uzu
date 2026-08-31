@@ -1,16 +1,13 @@
-use std::{sync::OnceLock, time::Instant};
+use std::{sync::LazyLock, time::Instant};
 
 use crate::common::envs;
 
-static START: OnceLock<Instant> = OnceLock::new();
-
-pub fn elapsed_ms() -> u128 {
-    START.get_or_init(Instant::now).elapsed().as_millis()
-}
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 pub fn _debug_log(args: std::fmt::Arguments) {
     if envs::build_debug() {
-        println!("cargo::warning=(build-debug) [{}ms] {}", elapsed_ms(), args);
+        let elapsed_ms = START.elapsed().as_millis();
+        println!("cargo::warning=(build-debug) [{elapsed_ms}ms] {args}");
     }
 }
 

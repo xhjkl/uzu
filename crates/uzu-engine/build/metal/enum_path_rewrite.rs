@@ -22,13 +22,6 @@ pub fn gpu_type_kind_for_c_type(
     enum_paths.kind_for(short_name)
 }
 
-pub fn is_enum_c_type(
-    enum_paths: &EnumPaths,
-    c_type: &str,
-) -> bool {
-    gpu_type_kind_for_c_type(enum_paths, c_type).is_some()
-}
-
 pub fn rewrite_for_rust(
     enum_paths: &EnumPaths,
     condition: &str,
@@ -39,7 +32,7 @@ pub fn rewrite_for_rust(
     Ok(parsed.into_token_stream())
 }
 
-pub(super) fn qualify_enum_path(
+pub fn qualify_enum_path(
     path: &Path,
     enum_paths: &EnumPaths,
 ) -> Option<Expr> {
