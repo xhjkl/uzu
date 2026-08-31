@@ -6,6 +6,7 @@ use itertools::Itertools;
 use super::{
     ast::{MetalArgument, MetalArgumentType, MetalKernelInfo, shared_element_type},
     enum_path_rewrite::is_enum_c_type,
+    variant_combinations::constrained_combinations,
 };
 use crate::common::{enum_paths::EnumPaths, identifiers::KernelName, mangling::static_mangle};
 
@@ -145,33 +146,42 @@ fn kernel_wrappers(
 
     let header = base_index.map(|&base| kernel_header(&bindings, base).into_boxed_str());
 
-    let evaluator = crate::common::constraints::Evaluator::new(
-        kernel.variants.as_deref().into_iter().flatten().flat_map(|tp| tp.variants.iter().map(|v| v.as_ref())),
-    );
-    for type_variant in if let Some(variants) = &kernel.variants {
-        variants
-            .iter()
-            .map(|type_parameter| type_parameter.variants.iter())
-            .multi_cartesian_product()
-            .map(|values| {
-                Some(
-                    variants
-                        .iter()
-                        .map(|tp| tp.name.to_string())
-                        .zip(values.iter().map(|v| v.to_string()))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect()
+    let type_variants = if let Some(variants) = &kernel.variants {
+        let constraints = crate::common::constraints::Constraints::new(
+            variants.iter().flat_map(|tp| tp.variants.iter().map(|variant| variant.as_ref())),
+            &kernel.constraints,
+        );
+        let domain_lengths = variants.iter().map(|parameter| parameter.variants.len()).collect::<Vec<_>>();
+        constrained_combinations(&domain_lengths, |selection, complete| {
+            let bindings = variants
+                .iter()
+                .zip(selection)
+                .filter_map(|(parameter, value)| {
+                    value.map(|value| (parameter.name.as_ref(), parameter.variants[value].as_ref()))
+                })
+                .collect::<Vec<_>>();
+            if complete {
+                constraints.satisfied(&bindings)
+            } else {
+                constraints.could_satisfy(&bindings)
+            }
+        })
+        .into_iter()
+        .map(|selection| {
+            Some(
+                variants
+                    .iter()
+                    .zip(selection)
+                    .map(|(parameter, value)| (parameter.name.to_string(), parameter.variants[value].to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
     } else {
         vec![None]
-    } {
-        if let Some(ref tv) = type_variant
-            && !evaluator.satisfied(tv, &kernel.constraints)
-        {
-            continue;
-        }
+    };
 
+    for type_variant in type_variants {
         let (wrapper_name, underlying_name) = if let Some(type_variant) = &type_variant {
             (
                 static_mangle(kernel.name.as_ref(), type_variant.iter().map(|(_k, v)| v.as_str())),
