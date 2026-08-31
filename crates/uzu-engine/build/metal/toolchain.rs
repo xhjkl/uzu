@@ -167,6 +167,7 @@ impl MetalToolchain {
 
     fn xcrun(&self) -> Command {
         let mut cmd = Command::new("xcrun");
+        cmd.kill_on_drop(true);
         cmd.args(["-sdk", self.sdk.to_str()]);
         cmd
     }

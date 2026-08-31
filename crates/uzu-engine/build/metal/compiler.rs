@@ -10,6 +10,7 @@ use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use itertools::{Itertools, izip};
 use quote::{format_ident, quote};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -30,6 +31,20 @@ use crate::{
 
 const MIN_VARIANTS_PER_SHARD: usize = 8;
 const MAX_VARIANTS_PER_SHARD: usize = 64;
+
+fn cargo_parallelism() -> usize {
+    let available = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4);
+    let Ok(num_jobs) = env::var("NUM_JOBS") else {
+        return available;
+    };
+    let Ok(num_jobs) = num_jobs.parse::<usize>() else {
+        return available;
+    };
+    if num_jobs == 0 {
+        return available;
+    }
+    num_jobs.min(available)
+}
 
 fn shard_footers(kernel_wrappers: &[KernelWrappers]) -> Vec<String> {
     let total_variants: usize = kernel_wrappers.iter().map(|kernel| kernel.variants.len()).sum();
@@ -85,6 +100,8 @@ pub struct MetalCompiler {
     output_directory: PathBuf,
     metallib_compressed: bool,
     toolchain: MetalToolchain,
+    build_permits: Semaphore,
+    num_parallel_jobs: usize,
     cache_key: [u8; blake3::OUT_LEN],
 }
 
@@ -108,6 +125,8 @@ impl MetalCompiler {
         let toolchain = MetalToolchain::from_env_with_include_dir(Some(gpu_types_directory.clone()))
             .await
             .context("cannot create toolchain")?;
+        let num_parallel_jobs = cargo_parallelism();
+        let build_permits = Semaphore::new(num_parallel_jobs);
 
         let cache_key = {
             let build_system_hash = caching::build_system_hash().context("cannot get build system hash")?;
@@ -126,6 +145,8 @@ impl MetalCompiler {
             output_directory,
             metallib_compressed,
             toolchain,
+            build_permits,
+            num_parallel_jobs,
             cache_key,
         })
     }
@@ -181,11 +202,11 @@ impl MetalCompiler {
             return Ok((kernel_path, cached.public_kernels, cached.has_kernels));
         }
 
-        let (metal_kernel_infos, dependencies) = self
-            .toolchain
-            .analyze(&source_path)
-            .await
-            .with_context(|| format!("cannot analyze {source_path_relative_str}"))?;
+        let permit = self.build_permits.acquire().await.context("build semaphore closed")?;
+        let analysis = self.toolchain.analyze(&source_path).await;
+        drop(permit);
+        let (metal_kernel_infos, dependencies) =
+            analysis.with_context(|| format!("cannot analyze {source_path_relative_str}"))?;
 
         let kernel_infos: Vec<MetalKernelInfo> = metal_kernel_infos.collect();
 
@@ -232,7 +253,9 @@ impl MetalCompiler {
                 |(footer, metallib_file, compressed_file)| {
                     let source_path = &source_path;
                     async move {
-                        let warnings = self.toolchain.compile(source_path, footer, metallib_file).await?;
+                        let permit = self.build_permits.acquire().await.context("build semaphore closed")?;
+                        let warnings = self.toolchain.compile(source_path, footer, metallib_file).await;
+                        let warnings = warnings?;
 
                         if self.metallib_compressed {
                             let metallib_file = metallib_file.clone();
@@ -245,6 +268,7 @@ impl MetalCompiler {
                             .await??;
                         }
 
+                        drop(permit);
                         anyhow::Ok(warnings)
                     }
                 },
@@ -331,7 +355,7 @@ impl Compiler for MetalCompiler {
             .map(|e| e.into_path())
             .collect();
 
-        let num_concurrent_compiles = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4) * 2;
+        let num_concurrent_sources = self.num_parallel_jobs.saturating_mul(2);
 
         let compiled: Vec<(KernelPath, Box<[Kernel]>, bool)> = stream::iter(metal_sources)
             .map(|path| async move {
@@ -339,7 +363,7 @@ impl Compiler for MetalCompiler {
                     .await
                     .with_context(|| format!("cannot compile {}", path.display()))
             })
-            .buffer_unordered(num_concurrent_compiles)
+            .buffer_unordered(num_concurrent_sources)
             .try_collect()
             .await?;
 
