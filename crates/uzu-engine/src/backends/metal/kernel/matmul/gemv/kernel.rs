@@ -9,7 +9,9 @@ use crate::{
             },
             kernel::matmul::{ExpertInput, MatmulA, MatmulArguments, MatmulB, MatmulError, MatmulShape},
         },
-        metal::{context::MetalContext, device_profile::DeviceProfile, error::MetalError, kernel::GemvMetalKernel},
+        metal::{
+            Metal, context::MetalContext, device_profile::DeviceProfile, error::MetalError, kernel::GemvMetalKernel,
+        },
     },
     data_type::DataType,
 };

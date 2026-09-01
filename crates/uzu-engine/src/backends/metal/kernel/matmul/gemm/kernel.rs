@@ -655,9 +655,7 @@ impl GemmKernel {
             base_gy,
             split_k,
             1,
-            1,
             true,
-            1,
             encoder,
         );
 
