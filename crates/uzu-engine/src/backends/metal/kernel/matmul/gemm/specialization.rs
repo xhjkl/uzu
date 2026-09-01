@@ -25,7 +25,17 @@ pub(super) struct GemmSpecialization {
     pub(super) a_group_size: Option<u32>,
     pub(super) stage_weight_scales: bool,
     pub(super) hoist_operand_addressing: bool,
-    pub(super) expert_routed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct RoutedGemmSpecialization {
+    pub(super) tiling: GemmTiling,
+    pub(super) output_transform: GemmDTransform,
+    pub(super) alignment: GemmAlignment,
+    pub(super) b_prologue: GemmBPrologueKind,
+    pub(super) bits_per_b: Option<u32>,
+    pub(super) b_group_size: Option<u32>,
+    pub(super) signed_codes: bool,
     pub(super) expert_bias: bool,
 }
 
@@ -59,8 +69,6 @@ impl GemmSpecialization {
                 true
             },
             hoist_operand_addressing: use_tuned_addressing && plan.should_hoist_operand_addressing(shape),
-            expert_routed: shape.expert_routed,
-            expert_bias: shape.expert_bias,
         };
         specialization.validate()?;
         Ok(specialization)
@@ -106,13 +114,59 @@ impl GemmSpecialization {
         if self.bits_per_b.is_some() && !self.transpose_b {
             return Err(GemmSpecializationError::PackedRequiresTransposedB);
         }
-        if self.expert_routed
-            && (self.use_mxu || !self.transpose_b || self.a_prologue != GemmAPrologueKind::FullPrecision)
-        {
+        Ok(())
+    }
+}
+
+impl RoutedGemmSpecialization {
+    pub(super) fn from_plan(
+        plan: GemmPlan,
+        shape: MatmulShape,
+        output_transform: GemmDTransform,
+        alignment: GemmAlignment,
+    ) -> Result<Self, GemmSpecializationError> {
+        let specialization = Self {
+            tiling: plan.tiling,
+            output_transform,
+            alignment,
+            b_prologue: shape.b_prologue,
+            bits_per_b: shape.b_bits,
+            b_group_size: shape.b_group_size,
+            signed_codes: shape.signed_codes,
+            expert_bias: shape.expert_bias,
+        };
+        specialization.validate(shape)?;
+        Ok(specialization)
+    }
+
+    fn validate(
+        self,
+        shape: MatmulShape,
+    ) -> Result<(), GemmSpecializationError> {
+        if plan_is_invalid_for_routing(shape, self.tiling) {
             return Err(GemmSpecializationError::UnsupportedExpertRouting);
+        }
+        if let Some(group_size) = self.b_group_size
+            && self.tiling.simdgroup_block_k() > group_size
+        {
+            return Err(GemmSpecializationError::SimdgroupKExceedsGroupSize {
+                simdgroup_k: self.tiling.simdgroup_block_k(),
+                group_size,
+            });
         }
         Ok(())
     }
+}
+
+fn plan_is_invalid_for_routing(
+    shape: MatmulShape,
+    tiling: GemmTiling,
+) -> bool {
+    !shape.expert_routed
+        || !shape.b_transpose
+        || !shape.a_full_precision
+        || tiling.is_mxu_variant()
+        || !matches!(tiling, GemmTiling::Tile16x64x16_Simdgroups1x2 | GemmTiling::Tile16x64x32_Simdgroups1x2)
 }
 
 impl GemmPlan {

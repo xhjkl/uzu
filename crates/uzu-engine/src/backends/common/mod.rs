@@ -10,6 +10,7 @@ mod hazard_tracker;
 pub mod kernel;
 pub mod microfloat;
 
+pub(crate) use allocator::AllocationIdentity;
 pub use allocator::{Allocation, AllocationPool, AllocationType, Allocator};
 pub use backend::Backend;
 pub use buffer::{

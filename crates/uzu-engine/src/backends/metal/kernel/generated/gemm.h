@@ -39,12 +39,14 @@ enum class GemmTiling : uint32_t {
   Tile64x64x16_Simdgroups2x2 = 2,
   Tile64x64x32_Simdgroups2x2 = 3,
   Tile32x32x32_Simdgroups2x2 = 4,
-  Tile16x32x256_Simdgroups1x1 = 5,
-  Tile16x128x256_Simdgroups1x4 = 6,
-  Tile32x64x256_Simdgroups2x2 = 7,
-  Tile64x32x256_Simdgroups4x1 = 8,
-  Tile64x64x256_Simdgroups2x2 = 9,
-  Tile128x128x256_Simdgroups4x4 = 10,
+  Tile16x64x16_Simdgroups1x2 = 5,
+  Tile16x64x32_Simdgroups1x2 = 6,
+  Tile16x32x256_Simdgroups1x1 = 7,
+  Tile16x128x256_Simdgroups1x4 = 8,
+  Tile32x64x256_Simdgroups2x2 = 9,
+  Tile64x32x256_Simdgroups4x1 = 10,
+  Tile64x64x256_Simdgroups2x2 = 11,
+  Tile128x128x256_Simdgroups4x4 = 12,
 };
 
 static constant constexpr uint32_t MXU_SIMDGROUP_BLOCK_K = 32;

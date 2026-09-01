@@ -107,7 +107,7 @@ impl GemmProblem {
         self,
         plan: GemmPlan,
     ) -> bool {
-        use super::specialization::GemmSpecialization;
+        use super::specialization::{GemmSpecialization, RoutedGemmSpecialization};
         use crate::backends::common::gpu_types::gemm::{GemmAPrologueKind, GemmAlignment};
 
         if self.validate_engine(plan.engine).is_err()
@@ -123,6 +123,9 @@ impl GemmProblem {
             self.shape.n.is_multiple_of(plan.tiling.block_n()),
             self.shape.k.is_multiple_of(plan.tiling.block_k()),
         );
+        if self.shape.expert_routed {
+            return RoutedGemmSpecialization::from_plan(plan, self.shape, self.shape.d_transform, alignment).is_ok();
+        }
         GemmSpecialization::from_plan(
             plan,
             self.shape,
@@ -232,6 +235,9 @@ fn select_tiling(
     engine: GemmEngine,
     profile: DeviceProfile,
 ) -> GemmTiling {
+    if shape.expert_routed {
+        return policy::routed_tile(shape.b_group_size);
+    }
     match engine {
         GemmEngine::Simdgroup if shape.b_kind != MatmulBKind::Dense => {
             policy::simdgroup_quant_tile(shape.m, shape.n, shape.b_group_size.unwrap_or(0), profile)

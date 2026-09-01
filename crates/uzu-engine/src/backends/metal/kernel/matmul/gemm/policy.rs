@@ -130,6 +130,14 @@ pub(super) fn simdgroup_quant_tile(
     }
 }
 
+pub(super) fn routed_tile(group_size: Option<u32>) -> GemmTiling {
+    if group_size == Some(16) {
+        GemmTiling::Tile16x64x16_Simdgroups1x2
+    } else {
+        GemmTiling::Tile16x64x32_Simdgroups1x2
+    }
+}
+
 pub(super) fn split_k_target_tiles(
     is_a_int8: bool,
     tiling: GemmTiling,

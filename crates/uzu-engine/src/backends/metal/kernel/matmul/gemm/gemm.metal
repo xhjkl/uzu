@@ -141,22 +141,15 @@ KERNEL(Gemm)(
     const device int8_t* a_int8 OPTIONAL(A_IS_INT8),
     const device float* a_scales OPTIONAL(A_IS_INT8),
     const device int32_t* a_group_sums OPTIONAL(NEEDS_ASYMMETRIC_WEIGHT_CORRECTION),
-    const device uint* route_offsets OPTIONAL(expert_routed),
-    const device uint* grouped_routes OPTIONAL(expert_routed),
-    const device BT* expert_biases OPTIONAL(expert_bias),
     const constant uzu::matmul::GemmParams* params,
     const constant uint& group_count_x,
     const constant uint& group_count_y,
     const constant uint& group_count_z,
-    const constant uint& routes_per_token,
-    const constant bool& input_is_route_major,
     const GemmDTransform output_transform SPECIALIZE,
     const GemmAlignment alignment SPECIALIZE,
     const bool signed_codes SPECIALIZE,
     const bool stage_weight_scales SPECIALIZE,
     const bool hoist_operand_addressing SPECIALIZE,
-    const bool expert_routed SPECIALIZE,
-    const bool expert_bias SPECIALIZE,
     threadgroup AT a_shared[GEMM_TGA_ELEMENTS],
     threadgroup BT b_shared[GEMM_TGB_ELEMENTS],
     const uint group_x GROUPS(group_count_x),
@@ -214,39 +207,114 @@ KERNEL(Gemm)(
     );
   } else {
     using Core = SimdgroupMmaCore<DT, GEMM_TILING, TRANSPOSE_B, LeftOperand, RightOperand>;
-    if (expert_routed) {
-      Core::run_routed(
-          left_storage,
-          right_storage,
-          d,
-          params,
-          alignment,
-          output_transform,
-          output_bias,
-          expert_biases,
-          route_offsets,
-          grouped_routes,
-          routes_per_token,
-          input_is_route_major,
-          group_count_z,
-          a_shared,
-          b_shared,
-          thread_context
-      );
-    } else {
-      Core::run(
-          left_storage,
-          right_storage,
-          d,
-          params,
-          alignment,
-          output_transform,
-          output_bias,
-          rht_factors,
-          a_shared,
-          b_shared,
-          thread_context
-      );
-    }
+    Core::run(
+        left_storage,
+        right_storage,
+        d,
+        params,
+        alignment,
+        output_transform,
+        output_bias,
+        rht_factors,
+        a_shared,
+        b_shared,
+        thread_context
+    );
   }
+}
+
+template <typename AT, typename BT, typename DT, GemmTiling GEMM_TILING, GemmBPrologueKind B_PROLOGUE, uint BITS, uint GROUP_SIZE>
+VARIANTS(AT, half, bfloat, float)
+VARIANTS(BT, half, bfloat, float)
+VARIANTS(DT, half, bfloat, float)
+CONSTRAINT(BT != "float" || (AT == "float" && DT == "float"))
+VARIANTS(
+    GEMM_TILING,
+    GemmTiling::Tile16x64x16_Simdgroups1x2,
+    GemmTiling::Tile16x64x32_Simdgroups1x2)
+VARIANTS(
+    B_PROLOGUE,
+    GemmBPrologueKind::FullPrecision,
+    GemmBPrologueKind::ScaleBiasDequant,
+    GemmBPrologueKind::ScaleZeroPointDequant,
+    GemmBPrologueKind::ScaleSymmetricDequant)
+VARIANTS(BITS, 0, 4, 8)
+VARIANTS(GROUP_SIZE, 0, 16, 32, 64, 128)
+CONSTRAINT(B_IS_DENSE == (BITS == 0))
+CONSTRAINT((BITS == 0) == (GROUP_SIZE == 0))
+CONSTRAINT(!B_IS_MXFP4 || (GROUP_SIZE == 16 || GROUP_SIZE == 32))
+CONSTRAINT(B_PROLOGUE == GemmBPrologueKind::FullPrecision || BT != "float")
+CONSTRAINT(
+    (GROUP_SIZE == 16) ==
+    (GEMM_TILING == GemmTiling::Tile16x64x16_Simdgroups1x2))
+KERNEL(RoutedGemm)(
+    const device AT* a,
+    const device BT* b,
+    device DT* d,
+    const device BT* scales OPTIONAL(B_PROLOGUE != GemmBPrologueKind::FullPrecision),
+    const device BT* biases OPTIONAL(B_PROLOGUE == GemmBPrologueKind::ScaleBiasDequant),
+    const device uint8_t* zero_points OPTIONAL(B_PROLOGUE == GemmBPrologueKind::ScaleZeroPointDequant),
+    const device uint8_t* microfloat_scales OPTIONAL(B_IS_MXFP4),
+    const device BT* microfloat_outer_scale OPTIONAL(B_IS_MXFP4),
+    const device BT* output_bias OPTIONAL(output_transform.contains(GemmDTransform::BIAS)),
+    const device uint* route_tiles,
+    const device uint* grouped_routes,
+    const device BT* expert_biases OPTIONAL(expert_bias),
+    const constant uzu::matmul::GemmParams* params,
+    const constant uint& routes_per_token,
+    const constant bool& input_is_route_major,
+    const GemmDTransform output_transform SPECIALIZE,
+    const GemmAlignment alignment SPECIALIZE,
+    const bool signed_codes SPECIALIZE,
+    const bool expert_bias SPECIALIZE,
+    threadgroup AT a_shared[
+        gemm_tiling_block_m(GEMM_TILING) *
+        (gemm_tiling_block_k(GEMM_TILING) + 16 / int(sizeof(AT)))],
+    threadgroup BT b_shared[
+        gemm_tiling_block_n(GEMM_TILING) *
+        (gemm_tiling_block_k(GEMM_TILING) + 16 / int(sizeof(BT)))],
+    const uint group_x GROUPS(INDIRECT),
+    const uint group_y GROUPS(INDIRECT),
+    const uint thread_x THREADS(METAL_SIMD_SIZE),
+    const uint thread_y THREADS(gemm_tiling_simdgroups_per_column(GEMM_TILING)),
+    const uint thread_z THREADS(gemm_tiling_simdgroups_per_row(GEMM_TILING)),
+    const ThreadContext thread_context
+) {
+  (void)group_x;
+  (void)group_y;
+  (void)thread_x;
+  (void)thread_y;
+  (void)thread_z;
+
+  using LeftOperand = operands::LeftOperandFor<GemmAPrologueKind::FullPrecision, AT, 0>;
+  using RightOperand = operands::RightOperandFor<B_PROLOGUE, ushort(BITS), ushort(GROUP_SIZE), BT>;
+  const auto left_storage = operands::pack_left<LeftOperand, AT>(a, nullptr, nullptr, nullptr);
+  const auto right_storage = operands::pack_right<RightOperand, BT>(
+      b,
+      scales,
+      biases,
+      zero_points,
+      microfloat_scales,
+      microfloat_outer_scale,
+      signed_codes
+  );
+
+  using Core = SimdgroupMmaCore<DT, GEMM_TILING, true, LeftOperand, RightOperand>;
+  Core::run_routed(
+      left_storage,
+      right_storage,
+      d,
+      params,
+      alignment,
+      output_transform,
+      output_bias,
+      expert_biases,
+      route_tiles,
+      grouped_routes,
+      routes_per_token,
+      input_is_route_major,
+      a_shared,
+      b_shared,
+      thread_context
+  );
 }

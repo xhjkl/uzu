@@ -4,7 +4,7 @@ use super::{
     GemmEngine, GemmPlan,
     route_plan::ExpertRoutePlanner,
     selection::{GemmProblem, outer_block_k},
-    specialization::GemmSpecialization,
+    specialization::{GemmSpecialization, RoutedGemmSpecialization},
 };
 use crate::{
     backends::{
@@ -24,7 +24,7 @@ use crate::{
             context::MetalContext,
             device_profile::DeviceProfile,
             error::MetalError,
-            kernel::{GemmMetalKernel, GemmSplitKReduceMetalKernel, TensorAddBiasMetalKernel},
+            kernel::{GemmMetalKernel, GemmSplitKReduceMetalKernel, RoutedGemmMetalKernel, TensorAddBiasMetalKernel},
         },
     },
     data_type::DataType,
@@ -35,6 +35,7 @@ pub struct GemmKernel {
     input_data_type: DataType,
     output_data_type: DataType,
     kernels: HashMap<GemmSpecialization, GemmMetalKernel>,
+    routed_kernels: HashMap<RoutedGemmSpecialization, RoutedGemmMetalKernel>,
     pub bias_add: TensorAddBiasMetalKernel,
     output_rht: ActivationTransform<Metal>,
     split_k_reduce: HashMap<GemmDTransform, GemmSplitKReduceMetalKernel>,
@@ -55,12 +56,40 @@ impl GemmKernel {
             input_data_type,
             output_data_type,
             kernels: HashMap::new(),
+            routed_kernels: HashMap::new(),
             bias_add,
             output_rht,
             split_k_reduce: HashMap::new(),
             route_planner: ExpertRoutePlanner::new(context, output_data_type)?,
         };
         Ok(kernel)
+    }
+
+    fn get_or_create_routed(
+        &mut self,
+        context: &MetalContext,
+        specialization: RoutedGemmSpecialization,
+    ) -> Result<&RoutedGemmMetalKernel, MetalError> {
+        match self.routed_kernels.entry(specialization) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let kernel = RoutedGemmMetalKernel::new(
+                    context,
+                    self.input_data_type,
+                    self.weights_data_type,
+                    self.output_data_type,
+                    specialization.tiling,
+                    specialization.b_prologue,
+                    specialization.bits_per_b.unwrap_or(0),
+                    specialization.b_group_size.unwrap_or(0),
+                    specialization.output_transform,
+                    specialization.alignment,
+                    specialization.signed_codes,
+                    specialization.expert_bias,
+                )?;
+                Ok(entry.insert(kernel))
+            },
+        }
     }
 
     fn get_or_create(
@@ -89,8 +118,6 @@ impl GemmKernel {
                     specialization.signed_codes,
                     specialization.stage_weight_scales,
                     specialization.hoist_operand_addressing,
-                    specialization.expert_routed,
-                    specialization.expert_bias,
                 )?;
                 Ok(entry.insert(kernel))
             },
@@ -168,22 +195,9 @@ impl GemmKernel {
             }
             .into());
         }
-        let route_plan = match routes {
-            Some(routes) => {
-                Some(self.route_planner.encode(routes, arguments.m, arguments.n, &mut *arguments.d, encoder)?)
-            },
-            None => None,
-        };
-        let route_offsets = route_plan.as_ref().map(|plan| &plan.offsets);
-        let grouped_routes = route_plan.as_ref().map(|plan| &plan.grouped_routes);
-        let (routes_per_token, input_is_route_major, row_partitions) = match routes {
-            Some(routes) => (
-                routes.routes_per_token.get(),
-                routes.input == ExpertInput::Routes,
-                arguments.m.div_ceil(plan.tiling.block_m()).clamp(1, 16),
-            ),
-            None => (1, true, 1),
-        };
+        if let Some(routes) = routes {
+            return self.encode_routed(arguments, routes, plan, encoder);
+        }
 
         let is_quant = shape.is_integer_quantized();
         if is_quant {
@@ -200,7 +214,6 @@ impl GemmKernel {
         let ab_scale = arguments.d_transform.ab_scale;
         let soft_cap = arguments.d_transform.soft_cap.unwrap_or(0.0);
         let output_bias = arguments.d_transform.bias;
-        let expert_biases = arguments.d_transform.per_matrix_bias;
         let rht_factors = arguments.d_transform.rht_factors;
         let output_transform = arguments.d_transform.mask();
 
@@ -250,15 +263,14 @@ impl GemmKernel {
                 };
                 let tiling = plan.tiling;
                 let alignment = GemmAlignment::new(
-                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
+                    m.is_multiple_of(tiling.block_m()),
                     n.is_multiple_of(tiling.block_n()),
                     k.is_multiple_of(tiling.block_k()),
                 );
                 let params = packed_params(shape, plan, ab_scale, soft_cap);
                 let group_count_x = n.div_ceil(tiling.block_n());
-                let group_count_y =
-                    routes.map_or_else(|| m.div_ceil(tiling.block_m()), |routes| routes.expert_count.get());
-                let group_count_z = routes.map_or(1, |_| row_partitions);
+                let group_count_y = m.div_ceil(tiling.block_m());
+                let group_count_z = 1;
                 let specialization = GemmSpecialization::from_plan(
                     plan,
                     shape,
@@ -283,15 +295,10 @@ impl GemmKernel {
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
-                    route_offsets,
-                    grouped_routes,
-                    expert_biases,
                     std::slice::from_ref(&params),
                     group_count_x,
                     group_count_y,
                     group_count_z,
-                    routes_per_token,
-                    input_is_route_major,
                     encoder,
                 );
             },
@@ -315,9 +322,7 @@ impl GemmKernel {
                 let threadgroups_per_row = n.div_ceil(tiling.block_n());
                 let threadgroups_per_column = m.div_ceil(tiling.block_m());
 
-                let (use_morton, group_count_x, group_count_y, group_count_z) = if let Some(routes) = routes {
-                    (false, threadgroups_per_row, routes.expert_count.get(), row_partitions)
-                } else if use_mxu {
+                let (use_morton, group_count_x, group_count_y, group_count_z) = if use_mxu {
                     let max_dim = threadgroups_per_row.max(threadgroups_per_column);
                     let min_dim = threadgroups_per_row.min(threadgroups_per_column);
                     let morton_dim = max_dim.next_power_of_two();
@@ -334,7 +339,7 @@ impl GemmKernel {
                 };
 
                 let alignment = GemmAlignment::new(
-                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
+                    m.is_multiple_of(tiling.block_m()),
                     n.is_multiple_of(tiling.block_n()),
                     k.is_multiple_of(tiling.block_k()),
                 );
@@ -404,15 +409,10 @@ impl GemmKernel {
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
                     None::<&Allocation<Metal>>,
-                    route_offsets,
-                    grouped_routes,
-                    expert_biases,
                     std::slice::from_ref(&params),
                     group_count_x,
                     group_count_y,
                     group_count_z,
-                    routes_per_token,
-                    input_is_route_major,
                     encoder,
                 );
             },
@@ -487,15 +487,14 @@ impl GemmKernel {
 
                 let tiling = plan.tiling;
                 let alignment = GemmAlignment::new(
-                    !shape.expert_routed && m.is_multiple_of(tiling.block_m()),
+                    m.is_multiple_of(tiling.block_m()),
                     n.is_multiple_of(tiling.block_n()),
                     k.is_multiple_of(tiling.block_k()),
                 );
                 let params = packed_params(shape, plan, ab_scale, soft_cap);
                 let group_count_x = n.div_ceil(tiling.block_n());
-                let group_count_y =
-                    routes.map_or_else(|| m.div_ceil(tiling.block_m()), |routes| routes.expert_count.get());
-                let group_count_z = routes.map_or(1, |_| row_partitions);
+                let group_count_y = m.div_ceil(tiling.block_m());
+                let group_count_z = 1;
 
                 if plan.split_k > 1 {
                     self.encode_split_k(
@@ -538,15 +537,10 @@ impl GemmKernel {
                         a_int8,
                         a_scales,
                         a_group_sums,
-                        route_offsets,
-                        grouped_routes,
-                        expert_biases,
                         std::slice::from_ref(&params),
                         group_count_x,
                         group_count_y,
                         group_count_z,
-                        routes_per_token,
-                        input_is_route_major,
                         encoder,
                     );
                 }
@@ -556,6 +550,191 @@ impl GemmKernel {
                     self.bias_add.encode(None::<&Allocation<Metal>>, bias, &mut *d, n, output_length, encoder);
                 }
             },
+        }
+
+        Ok(())
+    }
+
+    fn encode_routed<'a, 'b, 'd, TB: BufferArg<'b, Metal>>(
+        &mut self,
+        arguments: MatmulArguments<'a, 'b, 'd, Metal, TB>,
+        routes: crate::backends::common::kernel::matmul::ExpertRoutes<'a, Metal>,
+        plan: GemmPlan,
+        encoder: &mut Encoder<Metal>,
+    ) -> Result<(), MetalError> {
+        if !arguments.b_transpose || arguments.b_leading_dimension.is_some() {
+            return Err(MatmulError::UnsupportedRouting {
+                path: "RoutedGemm",
+                reason: "expert routing requires contiguous output-input weights",
+            }
+            .into());
+        }
+        let MatmulA::FullPrecision {
+            values: input,
+            offset: input_offset,
+        } = arguments.a
+        else {
+            return Err(MatmulError::IncompatibleA {
+                path: "RoutedGemm",
+                reason: "expert routing requires full-precision activations",
+            }
+            .into());
+        };
+
+        let shape = MatmulShape::from_arguments(&arguments);
+        let tiling = plan.tiling;
+        let column_tiles = arguments.n.div_ceil(tiling.block_n());
+        let prepared_routes = self.route_planner.prepare(routes, arguments.m, tiling.block_m(), encoder)?;
+        let dispatch_arguments = self.route_planner.encode_projection(
+            routes,
+            arguments.m,
+            arguments.n,
+            column_tiles,
+            &prepared_routes.plan.tile_count,
+            &mut *arguments.d,
+            encoder,
+        )?;
+        let alignment = GemmAlignment::new(
+            false,
+            arguments.n.is_multiple_of(tiling.block_n()),
+            arguments.k.is_multiple_of(tiling.block_k()),
+        );
+        let output_transform = arguments.d_transform.mask();
+        let specialization = RoutedGemmSpecialization::from_plan(plan, shape, output_transform, alignment)?;
+        let params =
+            packed_params(shape, plan, arguments.d_transform.ab_scale, arguments.d_transform.soft_cap.unwrap_or(0.0));
+        let routes_per_token = routes.routes_per_token.get();
+        let input_is_route_major = routes.input == ExpertInput::Routes;
+        let output_bias = arguments.d_transform.bias;
+        let expert_biases = arguments.d_transform.per_matrix_bias;
+        let MatmulArguments {
+            b,
+            d,
+            ..
+        } = arguments;
+        let kernel = self.get_or_create_routed(encoder.context(), specialization)?;
+
+        match b {
+            MatmulB::FullPrecision {
+                b: weights,
+            } => kernel.encode(
+                (input, input_offset),
+                weights,
+                &mut *d,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                output_bias,
+                &prepared_routes.plan.tiles,
+                &prepared_routes.plan.grouped_routes,
+                expert_biases,
+                std::slice::from_ref(&params),
+                routes_per_token,
+                input_is_route_major,
+                &dispatch_arguments,
+                encoder,
+            ),
+            MatmulB::Microfloat {
+                codes,
+                scales,
+                outer_scales,
+                ..
+            } => kernel.encode(
+                (input, input_offset),
+                codes,
+                &mut *d,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                Some(scales),
+                Some(outer_scales),
+                output_bias,
+                &prepared_routes.plan.tiles,
+                &prepared_routes.plan.grouped_routes,
+                expert_biases,
+                std::slice::from_ref(&params),
+                routes_per_token,
+                input_is_route_major,
+                &dispatch_arguments,
+                encoder,
+            ),
+            MatmulB::ScaleBiasDequant {
+                b: weights,
+                scales,
+                biases,
+                ..
+            } => kernel.encode(
+                (input, input_offset),
+                weights,
+                &mut *d,
+                Some(scales),
+                Some(biases),
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                output_bias,
+                &prepared_routes.plan.tiles,
+                &prepared_routes.plan.grouped_routes,
+                expert_biases,
+                std::slice::from_ref(&params),
+                routes_per_token,
+                input_is_route_major,
+                &dispatch_arguments,
+                encoder,
+            ),
+            MatmulB::ScaleZeroPointDequant {
+                b: weights,
+                scales,
+                zero_points,
+                ..
+            } => kernel.encode(
+                (input, input_offset),
+                weights,
+                &mut *d,
+                Some(scales),
+                None::<&Allocation<Metal>>,
+                Some(zero_points),
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                output_bias,
+                &prepared_routes.plan.tiles,
+                &prepared_routes.plan.grouped_routes,
+                expert_biases,
+                std::slice::from_ref(&params),
+                routes_per_token,
+                input_is_route_major,
+                &dispatch_arguments,
+                encoder,
+            ),
+            MatmulB::ScaleSymmetricDequant {
+                b: weights,
+                scales,
+                ..
+            } => kernel.encode(
+                (input, input_offset),
+                weights,
+                &mut *d,
+                Some(scales),
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                None::<&Allocation<Metal>>,
+                output_bias,
+                &prepared_routes.plan.tiles,
+                &prepared_routes.plan.grouped_routes,
+                expert_biases,
+                std::slice::from_ref(&params),
+                routes_per_token,
+                input_is_route_major,
+                &dispatch_arguments,
+                encoder,
+            ),
+        }
+
+        if prepared_routes.retain {
+            encoder.as_command_buffer_mut().insert_expert_route_plan(prepared_routes.key, prepared_routes.plan);
         }
 
         Ok(())
@@ -647,15 +826,10 @@ impl GemmKernel {
             a_int8,
             a_scales,
             a_group_sums,
-            None::<&Allocation<Metal>>,
-            None::<&Allocation<Metal>>,
-            None::<&Allocation<Metal>>,
             std::slice::from_ref(&params),
             base_gx,
             base_gy,
             split_k,
-            1,
-            true,
             encoder,
         );
 

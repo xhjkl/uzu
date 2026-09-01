@@ -14,14 +14,31 @@ use crate::backends::common::{
     allocator::{RangeAllocationType, RangeAllocator},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AllocationIdentity {
+    allocator: usize,
+    generation: usize,
+    revision: usize,
+}
+
 pub struct Allocation<B: Backend> {
     allocator: Arc<Allocator<B>>,
     buffer: Arc<B::DenseBuffer>,
     range: Range<usize>,
     allocation_type: RangeAllocationType,
+    generation: usize,
+    revision: usize,
 }
 
 impl<B: Backend> Allocation<B> {
+    pub(crate) fn identity(&self) -> AllocationIdentity {
+        AllocationIdentity {
+            allocator: Arc::as_ptr(&self.allocator) as usize,
+            generation: self.generation,
+            revision: self.revision,
+        }
+    }
+
     pub fn size(&self) -> usize {
         self.range.len()
     }
@@ -66,6 +83,7 @@ impl<B: Backend> AsBufferRangeRef for Allocation<B> {
 
 impl<B: Backend> AsBufferRangeMut for Allocation<B> {
     fn as_buffer_range_mut<'a>(&'a mut self) -> BufferRangeMut<'a, B::DenseBuffer> {
+        self.revision = self.revision.checked_add(1).expect("allocation revision exhausted");
         // SAFETY: allocator algorithm (hopefully if there is no bugs) guarantees no two overlapping live allocations can exist (which is the contract of BufferRangeMut)
         unsafe { BufferRangeMut::new_shared(self.buffer.as_ref(), self.range.clone()) }
     }
@@ -105,6 +123,7 @@ struct AllocatorBuffer<B: Backend> {
 pub struct Allocator<B: Backend> {
     context: Weak<B::Context>,
     allocator_buffers: Mutex<Vec<AllocatorBuffer<B>>>,
+    next_allocation_generation: AtomicUsize,
     next_pool_number: AtomicUsize,
     peak_memory_usage: AtomicUsize,
 }
@@ -114,6 +133,7 @@ impl<B: Backend> Allocator<B> {
         Arc::new(Self {
             context,
             allocator_buffers: Mutex::new(Vec::new()),
+            next_allocation_generation: AtomicUsize::new(0),
             next_pool_number: AtomicUsize::new(0),
             peak_memory_usage: AtomicUsize::new(0),
         })
@@ -125,6 +145,10 @@ impl<B: Backend> Allocator<B> {
         allocation_type: AllocationType<B>,
     ) -> Result<Allocation<B>, B::Error> {
         assert!(size > 0, "allocation size must be greater than 0");
+        let generation = self
+            .next_allocation_generation
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |generation| generation.checked_add(1))
+            .expect("allocation generation exhausted");
         let alignment =
             usize::clamp(size.next_power_of_two(), B::MIN_ALLOCATION_ALIGNMENT, B::MAX_ALLOCATION_ALIGNMENT);
         let allocation_type = match allocation_type {
@@ -180,6 +204,8 @@ impl<B: Backend> Allocator<B> {
             buffer,
             range,
             allocation_type,
+            generation,
+            revision: 0,
         })
     }
 
