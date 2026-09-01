@@ -12,11 +12,7 @@ use crate::{
         },
         metal::{
             device_profile::{DeviceIdentity, DeviceProfile, DeviceSize},
-            kernel::matmul::{
-                MatmulDispatch, MatmulMetalKernel,
-                gemm::GemmProblem,
-                gemv::{GemvPlan, GemvSpecialization},
-            },
+            kernel::matmul::{MatmulDispatch, MatmulMetalKernel, gemm::GemmProblem, gemv::GemvSpecialization},
         },
     },
     data_type::DataType,
@@ -114,8 +110,6 @@ fn table_is_complete_and_fingerprint_is_stable() {
                     assert_eq!(route(profile, &problem, true), Some(selected));
                     let runtime = MatmulMetalKernel::choose_dispatch(
                         &problem,
-                        1.0,
-                        None,
                         profile,
                         profile.supports_mxu(),
                         DataType::BF16,
@@ -132,9 +126,7 @@ fn table_is_complete_and_fingerprint_is_stable() {
                         )
                         .expect("stored GEMV tile must be legal");
                         assert_eq!(specialization.tile(), tile);
-                        assert!(
-                            matches!(runtime, MatmulDispatch::Gemv(GemvPlan::Generic(actual)) if actual == specialization)
-                        );
+                        assert!(matches!(runtime, MatmulDispatch::Gemv(actual) if actual == specialization));
                     } else if let QmvRoute::MainGemm(plan) = selected {
                         let problem =
                             GemmProblem::new(problem, DataType::BF16, DataType::BF16, profile.supports_mxu(), profile);
@@ -217,15 +209,13 @@ fn normal_routing_handles_inputs_outside_the_frozen_matrix() {
         assert!(matches!(
             MatmulMetalKernel::choose_dispatch(
                 &problem,
-                1.0,
-                None,
                 profile,
                 false,
                 DataType::BF16,
                 DataType::BF16,
                 DataType::BF16,
             ),
-            MatmulDispatch::Gemv(GemvPlan::Generic(actual)) if actual == specialization
+            MatmulDispatch::Gemv(actual) if actual == specialization
         ));
     }
 }
